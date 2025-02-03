@@ -9,6 +9,7 @@ import requests
 from atproto import Client
 from bs4 import BeautifulSoup
 
+
 # Global hashtags
 GLOBAL_HASHTAGS = "#f1 #formula1 #fia #AbuDhabiGP"
 
