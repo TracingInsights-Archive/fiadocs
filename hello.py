@@ -20,7 +20,8 @@ logging.basicConfig(
 
 class FIADocumentHandler:
     def __init__(self):
-        self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season-2024-2290"
+        # self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season-2024-2290"
+        self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season/season-2025-2071"
         self.download_dir = "downloads"
         self.processed_docs = self._load_processed_docs()
         self.bluesky_client = Client()
