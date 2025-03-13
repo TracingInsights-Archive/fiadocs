@@ -24,6 +24,7 @@ class FIADocumentHandler:
         self.download_dir = "downloads"
         self.processed_docs = self._load_processed_docs()
         self.bluesky_client = Client()
+        self.document_titles = {}
 
     def _load_processed_docs(self):
         try:
@@ -74,21 +75,7 @@ class FIADocumentHandler:
         soup = BeautifulSoup(response.content, "html.parser")
         documents = []
 
-        for link in soup.find_all("a"):
-            href = link.get("href", "")
-            if href.endswith(".pdf"):
-                doc_url = f"https://www.fia.com{href}" if href.startswith("/") else href
-                normalized_url = doc_url.strip().lower().replace("\\", "/")
-                filename = os.path.basename(normalized_url).lower()
-                if (
-                    normalized_url
-                    not in [url.lower() for url in self.processed_docs["urls"]]
-                    and filename not in self.processed_docs["filenames"]
-                    and doc_url not in documents
-                ):
-                    documents.append(doc_url)
-                    self.processed_docs["filenames"].add(filename)
-
+        # Extract documents and their titles
         doc_containers = soup.find_all(
             "div", class_=["document-listing", "document-container"]
         )
@@ -102,6 +89,47 @@ class FIADocumentHandler:
                 )
                 normalized_url = doc_url.strip().lower().replace("\\", "/")
                 filename = os.path.basename(normalized_url).lower()
+
+                # Extract title from the link text or parent elements
+                title = link.get_text(strip=True)
+                if not title:
+                    # Try to find a title in parent elements
+                    parent_title = container.find(class_="event-title")
+                    if parent_title:
+                        title = parent_title.get_text(strip=True)
+
+                # If still no title, use filename
+                if not title:
+                    title = filename
+
+                # Store the title for this document
+                self.document_titles[doc_url] = title
+
+                if (
+                    normalized_url
+                    not in [url.lower() for url in self.processed_docs["urls"]]
+                    and filename not in self.processed_docs["filenames"]
+                    and doc_url not in documents
+                ):
+                    documents.append(doc_url)
+                    self.processed_docs["filenames"].add(filename)
+
+        # Also check for direct links
+        for link in soup.find_all("a"):
+            href = link.get("href", "")
+            if href.endswith(".pdf"):
+                doc_url = f"https://www.fia.com{href}" if href.startswith("/") else href
+                normalized_url = doc_url.strip().lower().replace("\\", "/")
+                filename = os.path.basename(normalized_url).lower()
+
+                # Extract title from the link text
+                title = link.get_text(strip=True)
+                if not title:
+                    title = filename
+
+                # Store the title for this document
+                self.document_titles[doc_url] = title
+
                 if (
                     normalized_url
                     not in [url.lower() for url in self.processed_docs["urls"]]
@@ -184,15 +212,22 @@ class FIADocumentHandler:
         return future_races[next_race_date]
 
     def post_to_bluesky(self, image_paths, doc_url):
-        doc_name, pub_date = self._parse_document_info(doc_url)
+        # Use title instead of filename if available
+        if doc_url in self.document_titles and self.document_titles[doc_url]:
+            doc_title = self.document_titles[doc_url]
+        else:
+            # Fall back to the old method if title not found
+            doc_title, _ = self._parse_document_info(doc_url)
+
+        pub_date = self._extract_timestamp_from_doc(doc_url)
         gp_hashtag = self._get_current_gp_hashtag()
 
-        max_doc_name_length = 200
-        if len(doc_name) > max_doc_name_length:
-            doc_name = doc_name[: max_doc_name_length - 3] + "..."
+        max_title_length = 200
+        if len(doc_title) > max_title_length:
+            doc_title = doc_title[: max_title_length - 3] + "..."
 
         all_hashtags = f"{GLOBAL_HASHTAGS}"
-        formatted_text = f"{doc_name}\n\n{all_hashtags}"
+        formatted_text = f"{doc_title}\n\n{all_hashtags}"
 
         if len(formatted_text) + len(doc_url) + 1 <= 300:
             formatted_text += f"\n\n{doc_url}"
