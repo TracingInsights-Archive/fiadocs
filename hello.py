@@ -10,7 +10,7 @@ from atproto import Client
 from bs4 import BeautifulSoup
 
 # Global hashtags
-GLOBAL_HASHTAGS = "#f1 #formula1 #fia #AustralianGP"
+GLOBAL_HASHTAGS = "#f1 #formula1 #fia #BahrainGP"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
