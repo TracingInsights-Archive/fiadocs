@@ -218,7 +218,7 @@ class FIADocumentHandler:
             )
 
         # Make all hashtags clickable
-        all_tags = ["f1", "formula1", "fia", "AbuDhabiGP"]
+        all_tags = ["f1", "formula1", "fia", "BahrainGP"]
         for tag in all_tags:
             tag_with_hash = f"#{tag}"
             tag_pos = formatted_text.find(tag_with_hash)
