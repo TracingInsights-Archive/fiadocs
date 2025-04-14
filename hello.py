@@ -9,8 +9,8 @@ import requests
 from atproto import Client
 from bs4 import BeautifulSoup
 
-# Global hashtags
-GLOBAL_HASHTAGS = "#f1 #formula1 #fia #BahrainGP"
+# Global hashtags - Change in 2 places
+GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SaudiArabianGP"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -218,7 +218,7 @@ class FIADocumentHandler:
             )
 
         # Make all hashtags clickable
-        all_tags = ["f1", "formula1", "fia", "BahrainGP"]
+        all_tags = ["f1", "formula1", "fia", "SaudiArabianGP"]
         for tag in all_tags:
             tag_with_hash = f"#{tag}"
             tag_pos = formatted_text.find(tag_with_hash)
