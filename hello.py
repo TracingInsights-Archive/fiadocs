@@ -69,49 +69,94 @@ class FIADocumentHandler:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
-        url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season/season-2025-2071"
-        response = requests.get(url, headers=headers)
+        response = requests.get(self.base_url, headers=headers)
         soup = BeautifulSoup(response.content, "html.parser")
         documents = []
+        document_info = {}  # Store document metadata: {url: {"title": title, "published": date}}
 
-        for link in soup.find_all("a"):
-            href = link.get("href", "")
-            if href.endswith(".pdf"):
-                doc_url = f"https://www.fia.com{href}" if href.startswith("/") else href
-                normalized_url = doc_url.strip().lower().replace("\\", "/")
-                filename = os.path.basename(normalized_url).lower()
-                if (
-                    normalized_url
-                    not in [url.lower() for url in self.processed_docs["urls"]]
-                    and filename not in self.processed_docs["filenames"]
-                    and doc_url not in documents
-                ):
-                    documents.append(doc_url)
-                    self.processed_docs["filenames"].add(filename)
+        # Process document rows which contain title and published date
+        doc_rows = soup.find_all("li", class_="document-row")
+        for row in doc_rows:
+            link_element = row.find("a", href=lambda x: x and x.endswith(".pdf"))
+            if not link_element:
+                continue
 
-        doc_containers = soup.find_all(
-            "div", class_=["document-listing", "document-container"]
-        )
-        for container in doc_containers:
-            pdf_links = container.find_all("a", href=lambda x: x and x.endswith(".pdf"))
-            for link in pdf_links:
-                doc_url = (
-                    f"https://www.fia.com{link['href']}"
-                    if link["href"].startswith("/")
-                    else link["href"]
-                )
-                normalized_url = doc_url.strip().lower().replace("\\", "/")
-                filename = os.path.basename(normalized_url).lower()
-                if (
-                    normalized_url
-                    not in [url.lower() for url in self.processed_docs["urls"]]
-                    and filename not in self.processed_docs["filenames"]
-                    and doc_url not in documents
-                ):
-                    documents.append(doc_url)
-                    self.processed_docs["filenames"].add(filename)
+            href = link_element.get("href", "")
+            doc_url = f"https://www.fia.com{href}" if href.startswith("/") else href
+            normalized_url = doc_url.strip().lower().replace("\\", "/")
+            filename = os.path.basename(normalized_url).lower()
 
-        return documents
+            # Extract title from the document
+            title_element = row.find("div", class_="field-name-title-field")
+            title = ""
+            if title_element:
+                title_item = title_element.find("div", class_="field-item")
+                if title_item:
+                    title = title_item.text.strip()
+
+            # Extract published date
+            published_element = row.find("div", class_="field-name-field-published-date")
+            published_date = ""
+            if published_element:
+                date_element = published_element.find("span", class_="date-display-single")
+                if date_element:
+                    published_date = date_element.text.strip()
+
+            # Store document metadata
+            document_info[doc_url] = {
+                "title": title,
+                "published": published_date
+            }
+
+            if (
+                normalized_url
+                not in [url.lower() for url in self.processed_docs["urls"]]
+                and filename not in self.processed_docs["filenames"]
+                and doc_url not in documents
+            ):
+                documents.append(doc_url)
+                self.processed_docs["filenames"].add(filename)
+
+        # Fallback to the original method if no documents found with the new approach
+        if not documents:
+            for link in soup.find_all("a"):
+                href = link.get("href", "")
+                if href.endswith(".pdf"):
+                    doc_url = f"https://www.fia.com{href}" if href.startswith("/") else href
+                    normalized_url = doc_url.strip().lower().replace("\\", "/")
+                    filename = os.path.basename(normalized_url).lower()
+                    if (
+                        normalized_url
+                        not in [url.lower() for url in self.processed_docs["urls"]]
+                        and filename not in self.processed_docs["filenames"]
+                        and doc_url not in documents
+                    ):
+                        documents.append(doc_url)
+                        self.processed_docs["filenames"].add(filename)
+
+            doc_containers = soup.find_all(
+                "div", class_=["document-listing", "document-container"]
+            )
+            for container in doc_containers:
+                pdf_links = container.find_all("a", href=lambda x: x and x.endswith(".pdf"))
+                for link in pdf_links:
+                    doc_url = (
+                        f"https://www.fia.com{link['href']}"
+                        if link["href"].startswith("/")
+                        else link["href"]
+                    )
+                    normalized_url = doc_url.strip().lower().replace("\\", "/")
+                    filename = os.path.basename(normalized_url).lower()
+                    if (
+                        normalized_url
+                        not in [url.lower() for url in self.processed_docs["urls"]]
+                        and filename not in self.processed_docs["filenames"]
+                        and doc_url not in documents
+                    ):
+                        documents.append(doc_url)
+                        self.processed_docs["filenames"].add(filename)
+
+        return documents, document_info
 
     def download_and_convert_pdf(self, url):
         response = requests.get(url, allow_redirects=True)
@@ -141,7 +186,16 @@ class FIADocumentHandler:
             pass
         return datetime.now()
 
-    def _parse_document_info(self, doc_url):
+    def _parse_document_info(self, doc_url, doc_info=None):
+        if doc_info and doc_url in doc_info:
+            info = doc_info[doc_url]
+            title = info.get("title", "")
+            published_date = info.get("published", "")
+
+            if title and published_date:
+                return title, published_date
+
+        # Fallback to original method
         filename = os.path.basename(doc_url)
         doc_date = self._extract_timestamp_from_doc(doc_url)
         formatted_date = doc_date.strftime("%d.%m.%y %H:%M CET")
@@ -183,16 +237,16 @@ class FIADocumentHandler:
         next_race_date = min(future_races.keys())
         return future_races[next_race_date]
 
-    def post_to_bluesky(self, image_paths, doc_url):
-        doc_name, pub_date = self._parse_document_info(doc_url)
+    def post_to_bluesky(self, image_paths, doc_url, doc_info=None):
+        doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
         gp_hashtag = self._get_current_gp_hashtag()
 
-        max_doc_name_length = 200
-        if len(doc_name) > max_doc_name_length:
-            doc_name = doc_name[: max_doc_name_length - 3] + "..."
+        max_title_length = 200
+        if len(doc_title) > max_title_length:
+            doc_title = doc_title[: max_title_length - 3] + "..."
 
         all_hashtags = f"{GLOBAL_HASHTAGS}"
-        formatted_text = f"{doc_name}\n\n{all_hashtags}"
+        formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
 
         if len(formatted_text) + len(doc_url) + 1 <= 300:
             formatted_text += f"\n\n{doc_url}"
@@ -241,75 +295,79 @@ class FIADocumentHandler:
 
         for i in range(0, len(image_paths), 4):
             chunk = image_paths[i : i + 4]
-            images = {"$type": "app.bsky.embed.images", "images": []}
-
+            images = []
             for img_path in chunk:
                 with open(img_path, "rb") as f:
-                    image_data = f.read()
-                response = self.bluesky_client.upload_blob(image_data)
-                images["images"].append({"image": response.blob, "alt": doc_name})
+                    img_data = f.read()
+                    img_upload = self.bluesky_client.com.atproto.repo.upload_blob(img_data)
+                    images.append(
+                        {
+                            "alt": f"Page {i + chunk.index(img_path) + 1} of {doc_title}",
+                            "image": img_upload.blob,
+                        }
+                    )
+
+            post_params = {
+                "text": formatted_text,
+                "facets": facets,
+                "embed": {"$type": "app.bsky.embed.images", "images": images},
+            }
 
             if parent_post:
-                reply = {
-                    "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
-                    "parent": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
+                post_params["reply"] = {
+                    "root": root_post,
+                    "parent": parent_post,
                 }
-                post_result = self.bluesky_client.post(
-                    text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
-                    embed=images,
-                    reply_to=reply,
-                )
-                parent_post = {"uri": post_result.uri, "cid": post_result.cid}
-            else:
-                post_result = self.bluesky_client.post(
-                    text=formatted_text, facets=facets, embed=images
-                )
-                root_post = {"uri": post_result.uri, "cid": post_result.cid}
-                parent_post = root_post
 
+            response = self.bluesky_client.com.atproto.repo.create_record(
+                collection="app.bsky.feed.post",
+                repo=self.bluesky_client.me.did,
+                record=post_params,
+            )
 
-def main():
-    logging.info("Starting FIA Document Handler")
-    handler = FIADocumentHandler()
-    try:
-        handler.authenticate_bluesky(
-            os.environ["BLUESKY_USERNAME"],
-            os.environ["BLUESKY_PASSWORD"],
-            max_retries=3,
-            timeout=30,
-        )
-        documents = handler.fetch_documents()
-        unique_documents = list(dict.fromkeys(documents))
-        logging.info(f"Found {len(unique_documents)} new documents to process")
+            if not root_post:
+                root_post = {"uri": response.uri, "cid": response.cid}
+            parent_post = {"uri": response.uri, "cid": response.cid}
 
-        for doc_url in unique_documents:
-            try:
-                normalized_url = doc_url.strip().lower().replace("\\", "/")
-                if normalized_url in [
-                    url.lower() for url in handler.processed_docs["urls"]
-                ]:
-                    logging.info(f"Skipping already processed document: {doc_url}")
-                    continue
+            # Clean up image files
+            for img_path in chunk:
+                try:
+                    os.remove(img_path)
+                except Exception as e:
+                    logging.warning(f"Failed to remove image {img_path}: {str(e)}")
 
-                image_paths = handler.download_and_convert_pdf(doc_url)
-                handler.post_to_bluesky(image_paths, doc_url)
-                handler.processed_docs["urls"].append(doc_url)
-                handler._save_processed_docs()
+        # Add to processed docs
+        self.processed_docs["urls"].append(doc_url)
+        self._save_processed_docs()
 
-                for img_path in image_paths:
-                    if os.path.exists(img_path):
-                        os.remove(img_path)
+    def process_new_documents(self, username, password):
+        try:
+            self.authenticate_bluesky(username, password)
+            documents, document_info = self.fetch_documents()
+            if not documents:
+                logging.info("No new documents found")
+                return
 
-            except Exception as e:
-                logging.error(f"Error processing document {doc_url}: {str(e)}")
-                continue
-
-    except Exception as e:
-        logging.error(f"Fatal error: {str(e)}")
-        raise
-
-    logging.info("FIA Document Handler completed successfully")
+            logging.info(f"Found {len(documents)} new documents")
+            for doc_url in documents:
+                try:
+                    logging.info(f"Processing document: {doc_url}")
+                    image_paths = self.download_and_convert_pdf(doc_url)
+                    self.post_to_bluesky(image_paths, doc_url, document_info)
+                    logging.info(f"Successfully posted document: {doc_url}")
+                except Exception as e:
+                    logging.error(f"Error processing document {doc_url}: {str(e)}")
+        except Exception as e:
+            logging.error(f"Error in process_new_documents: {str(e)}")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="FIA Document Handler")
+    parser.add_argument("--username", required=True, help="Bluesky username")
+    parser.add_argument("--password", required=True, help="Bluesky password")
+    args = parser.parse_args()
+
+    handler = FIADocumentHandler()
+    handler.process_new_documents(args.username, args.password)
