@@ -193,6 +193,9 @@ class FIADocumentHandler:
             published_date = info.get("published", "")
 
             if title and published_date:
+                # Add CET to the published date if it doesn't already have it
+                if not published_date.endswith("CET"):
+                    published_date = f"{published_date} CET"
                 return title, published_date
 
         # Fallback to original method
