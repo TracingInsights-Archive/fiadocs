@@ -295,79 +295,75 @@ class FIADocumentHandler:
 
         for i in range(0, len(image_paths), 4):
             chunk = image_paths[i : i + 4]
-            images = []
+            images = {"$type": "app.bsky.embed.images", "images": []}
+
             for img_path in chunk:
                 with open(img_path, "rb") as f:
-                    img_data = f.read()
-                    img_upload = self.bluesky_client.com.atproto.repo.upload_blob(img_data)
-                    images.append(
-                        {
-                            "alt": f"Page {i + chunk.index(img_path) + 1} of {doc_title}",
-                            "image": img_upload.blob,
-                        }
-                    )
-
-            post_params = {
-                "text": formatted_text,
-                "facets": facets,
-                "embed": {"$type": "app.bsky.embed.images", "images": images},
-            }
+                    image_data = f.read()
+                response = self.bluesky_client.upload_blob(image_data)
+                images["images"].append({"image": response.blob, "alt": doc_title})
 
             if parent_post:
-                post_params["reply"] = {
-                    "root": root_post,
-                    "parent": parent_post,
+                reply = {
+                    "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
+                    "parent": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
                 }
+                post_result = self.bluesky_client.post(
+                    text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
+                    embed=images,
+                    reply_to=reply,
+                )
+                parent_post = {"uri": post_result.uri, "cid": post_result.cid}
+            else:
+                post_result = self.bluesky_client.post(
+                    text=formatted_text, facets=facets, embed=images
+                )
+                root_post = {"uri": post_result.uri, "cid": post_result.cid}
+                parent_post = root_post
 
-            response = self.bluesky_client.com.atproto.repo.create_record(
-                collection="app.bsky.feed.post",
-                repo=self.bluesky_client.me.did,
-                record=post_params,
-            )
 
-            if not root_post:
-                root_post = {"uri": response.uri, "cid": response.cid}
-            parent_post = {"uri": response.uri, "cid": response.cid}
+def main():
+    logging.info("Starting FIA Document Handler")
+    handler = FIADocumentHandler()
+    try:
+        handler.authenticate_bluesky(
+            os.environ["BLUESKY_USERNAME"],
+            os.environ["BLUESKY_PASSWORD"],
+            max_retries=3,
+            timeout=30,
+        )
+        documents, document_info = handler.fetch_documents()
+        unique_documents = list(dict.fromkeys(documents))
+        logging.info(f"Found {len(unique_documents)} new documents to process")
 
-            # Clean up image files
-            for img_path in chunk:
-                try:
-                    os.remove(img_path)
-                except Exception as e:
-                    logging.warning(f"Failed to remove image {img_path}: {str(e)}")
+        for doc_url in unique_documents:
+            try:
+                normalized_url = doc_url.strip().lower().replace("\\", "/")
+                if normalized_url in [
+                    url.lower() for url in handler.processed_docs["urls"]
+                ]:
+                    logging.info(f"Skipping already processed document: {doc_url}")
+                    continue
 
-        # Add to processed docs
-        self.processed_docs["urls"].append(doc_url)
-        self._save_processed_docs()
+                image_paths = handler.download_and_convert_pdf(doc_url)
+                handler.post_to_bluesky(image_paths, doc_url, document_info)
+                handler.processed_docs["urls"].append(doc_url)
+                handler._save_processed_docs()
 
-    def process_new_documents(self, username, password):
-        try:
-            self.authenticate_bluesky(username, password)
-            documents, document_info = self.fetch_documents()
-            if not documents:
-                logging.info("No new documents found")
-                return
+                for img_path in image_paths:
+                    if os.path.exists(img_path):
+                        os.remove(img_path)
 
-            logging.info(f"Found {len(documents)} new documents")
-            for doc_url in documents:
-                try:
-                    logging.info(f"Processing document: {doc_url}")
-                    image_paths = self.download_and_convert_pdf(doc_url)
-                    self.post_to_bluesky(image_paths, doc_url, document_info)
-                    logging.info(f"Successfully posted document: {doc_url}")
-                except Exception as e:
-                    logging.error(f"Error processing document {doc_url}: {str(e)}")
-        except Exception as e:
-            logging.error(f"Error in process_new_documents: {str(e)}")
+            except Exception as e:
+                logging.error(f"Error processing document {doc_url}: {str(e)}")
+                continue
+
+    except Exception as e:
+        logging.error(f"Fatal error: {str(e)}")
+        raise
+
+    logging.info("FIA Document Handler completed successfully")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="FIA Document Handler")
-    parser.add_argument("--username", required=True, help="Bluesky username")
-    parser.add_argument("--password", required=True, help="Bluesky password")
-    args = parser.parse_args()
-
-    handler = FIADocumentHandler()
-    handler.process_new_documents(args.username, args.password)
+    main()
