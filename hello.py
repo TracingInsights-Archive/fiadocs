@@ -19,7 +19,6 @@ logging.basicConfig(
 
 class FIADocumentHandler:
     def __init__(self):
-        # self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season-2024-2290"
         self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season/season-2025-2071"
         self.download_dir = "downloads"
         self.processed_docs = self._load_processed_docs()
@@ -64,6 +63,15 @@ class FIADocumentHandler:
                 )
                 time.sleep(2**attempt)
 
+    def _make_filename_readable(self, filename):
+        # Remove file extension
+        filename = os.path.splitext(filename)[0]
+        # Replace underscores and hyphens with spaces
+        filename = filename.replace("_", " ").replace("-", " ")
+        # Capitalize words
+        filename = " ".join(word.capitalize() for word in filename.split())
+        return filename
+
     def fetch_documents(self):
         logging.info(f"Fetching documents from {self.base_url}")
         headers = {
@@ -72,7 +80,7 @@ class FIADocumentHandler:
         response = requests.get(self.base_url, headers=headers)
         soup = BeautifulSoup(response.content, "html.parser")
         documents = []
-        document_info = {}  # Store document metadata: {url: {"title": title, "published": date}}
+        document_info = {}
 
         # Process document rows which contain title and published date
         doc_rows = soup.find_all("li", class_="document-row")
@@ -87,26 +95,19 @@ class FIADocumentHandler:
             filename = os.path.basename(normalized_url).lower()
 
             # Extract title from the document
-            title_element = row.find("div", class_="field-name-title-field")
-            title = ""
-            if title_element:
-                title_item = title_element.find("div", class_="field-item")
-                if title_item:
-                    title = title_item.text.strip()
+            title_div = row.find("div", class_="title")
+            title = title_div.text.strip() if title_div else ""
 
             # Extract published date
-            published_element = row.find("div", class_="field-name-field-published-date")
+            published_element = row.find("div", class_="published")
             published_date = ""
             if published_element:
-                date_element = published_element.find("span", class_="date-display-single")
-                if date_element:
-                    published_date = date_element.text.strip()
+                date_span = published_element.find("span", class_="date-display-single")
+                if date_span:
+                    published_date = date_span.text.strip()
 
             # Store document metadata
-            document_info[doc_url] = {
-                "title": title,
-                "published": published_date
-            }
+            document_info[doc_url] = {"title": title, "published": published_date}
 
             if (
                 normalized_url
@@ -116,45 +117,6 @@ class FIADocumentHandler:
             ):
                 documents.append(doc_url)
                 self.processed_docs["filenames"].add(filename)
-
-        # Fallback to the original method if no documents found with the new approach
-        if not documents:
-            for link in soup.find_all("a"):
-                href = link.get("href", "")
-                if href.endswith(".pdf"):
-                    doc_url = f"https://www.fia.com{href}" if href.startswith("/") else href
-                    normalized_url = doc_url.strip().lower().replace("\\", "/")
-                    filename = os.path.basename(normalized_url).lower()
-                    if (
-                        normalized_url
-                        not in [url.lower() for url in self.processed_docs["urls"]]
-                        and filename not in self.processed_docs["filenames"]
-                        and doc_url not in documents
-                    ):
-                        documents.append(doc_url)
-                        self.processed_docs["filenames"].add(filename)
-
-            doc_containers = soup.find_all(
-                "div", class_=["document-listing", "document-container"]
-            )
-            for container in doc_containers:
-                pdf_links = container.find_all("a", href=lambda x: x and x.endswith(".pdf"))
-                for link in pdf_links:
-                    doc_url = (
-                        f"https://www.fia.com{link['href']}"
-                        if link["href"].startswith("/")
-                        else link["href"]
-                    )
-                    normalized_url = doc_url.strip().lower().replace("\\", "/")
-                    filename = os.path.basename(normalized_url).lower()
-                    if (
-                        normalized_url
-                        not in [url.lower() for url in self.processed_docs["urls"]]
-                        and filename not in self.processed_docs["filenames"]
-                        and doc_url not in documents
-                    ):
-                        documents.append(doc_url)
-                        self.processed_docs["filenames"].add(filename)
 
         return documents, document_info
 
@@ -187,22 +149,21 @@ class FIADocumentHandler:
         return datetime.now()
 
     def _parse_document_info(self, doc_url, doc_info=None):
-        if doc_info and doc_url in doc_info:
+        if doc_info and doc_url in doc_info and doc_info[doc_url]["title"]:
             info = doc_info[doc_url]
-            title = info.get("title", "")
-            published_date = info.get("published", "")
+            title = info["title"]
+            published_date = info["published"]
 
-            if title and published_date:
-                # Add CET to the published date if it doesn't already have it
-                if not published_date.endswith("CET"):
-                    published_date = f"{published_date} CET"
-                return title, published_date
+            if not published_date.endswith("CET"):
+                published_date = f"{published_date} CET"
+            return title, published_date
 
-        # Fallback to original method
+        # Fallback to making filename human readable
         filename = os.path.basename(doc_url)
+        readable_title = self._make_filename_readable(filename)
         doc_date = self._extract_timestamp_from_doc(doc_url)
         formatted_date = doc_date.strftime("%d.%m.%y %H:%M CET")
-        return filename, formatted_date
+        return readable_title, formatted_date
 
     def _get_current_gp_hashtag(self):
         f1_calendar = {
