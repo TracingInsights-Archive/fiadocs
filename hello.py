@@ -6,6 +6,7 @@ from datetime import datetime
 
 import pdf2image
 import requests
+import tweepy
 from atproto import Client
 from bs4 import BeautifulSoup
 
@@ -23,6 +24,7 @@ class FIADocumentHandler:
         self.download_dir = "downloads"
         self.processed_docs = self._load_processed_docs()
         self.bluesky_client = Client()
+        self.twitter_client = None
 
     def _load_processed_docs(self):
         try:
@@ -60,6 +62,27 @@ class FIADocumentHandler:
                     raise
                 logging.warning(
                     f"Authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+
+    def authenticate_twitter(
+        self, api_key, api_secret, access_token, access_token_secret, max_retries=3
+    ):
+        for attempt in range(max_retries):
+            try:
+                auth = tweepy.OAuth1UserHandler(
+                    api_key, api_secret, access_token, access_token_secret
+                )
+                self.twitter_client = tweepy.API(auth)
+                # Verify credentials
+                self.twitter_client.verify_credentials()
+                logging.info("Successfully authenticated with Twitter")
+                return
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                logging.warning(
+                    f"Twitter authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
                 )
                 time.sleep(2**attempt)
 
@@ -285,6 +308,67 @@ class FIADocumentHandler:
                 root_post = {"uri": post_result.uri, "cid": post_result.cid}
                 parent_post = root_post
 
+    def post_to_twitter(self, image_paths, doc_url, doc_info=None):
+        if not self.twitter_client:
+            logging.warning("Twitter client not authenticated. Skipping Twitter post.")
+            return
+
+        doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+        gp_hashtag = self._get_current_gp_hashtag()
+
+        # Twitter has a 280 character limit
+        max_title_length = 180
+        if len(doc_title) > max_title_length:
+            doc_title = doc_title[: max_title_length - 3] + "..."
+
+        all_hashtags = f"{GLOBAL_HASHTAGS}"
+        formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+
+        # Add URL if there's room
+        if len(formatted_text) + len(doc_url) + 1 <= 280:
+            formatted_text += f"\n\n{doc_url}"
+
+        # Twitter allows up to 4 images per tweet
+        previous_tweet_id = None
+
+        for i in range(0, len(image_paths), 4):
+            chunk = image_paths[i : i + 4]
+            media_ids = []
+
+            for img_path in chunk:
+                try:
+                    media = self.twitter_client.media_upload(img_path)
+                    media_ids.append(media.media_id)
+                except Exception as e:
+                    logging.error(f"Error uploading image to Twitter: {str(e)}")
+
+            tweet_text = (
+                formatted_text
+                if i == 0
+                else f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})"
+            )
+
+            try:
+                if previous_tweet_id:
+                    # Reply to the previous tweet in the thread
+                    tweet = self.twitter_client.update_status(
+                        status=tweet_text,
+                        media_ids=media_ids,
+                        in_reply_to_status_id=previous_tweet_id,
+                        auto_populate_reply_metadata=True,
+                    )
+                else:
+                    # First tweet in the thread
+                    tweet = self.twitter_client.update_status(
+                        status=tweet_text, media_ids=media_ids
+                    )
+
+                previous_tweet_id = tweet.id
+                logging.info(f"Posted to Twitter: {tweet.id}")
+
+            except Exception as e:
+                logging.error(f"Error posting to Twitter: {str(e)}")
+
 
 def main():
     logging.info("Starting FIA Document Handler")
@@ -296,6 +380,16 @@ def main():
             max_retries=3,
             timeout=30,
         )
+
+        # Authenticate with Twitter
+        handler.authenticate_twitter(
+            os.environ["TWITTER_API_KEY"],
+            os.environ["TWITTER_API_SECRET"],
+            os.environ["TWITTER_ACCESS_TOKEN"],
+            os.environ["TWITTER_ACCESS_TOKEN_SECRET"],
+            max_retries=3,
+        )
+
         documents, document_info = handler.fetch_documents()
         unique_documents = list(dict.fromkeys(documents))
         logging.info(f"Found {len(unique_documents)} new documents to process")
@@ -310,7 +404,11 @@ def main():
                     continue
 
                 image_paths = handler.download_and_convert_pdf(doc_url)
+
+                # Post to both platforms
                 handler.post_to_bluesky(image_paths, doc_url, document_info)
+                handler.post_to_twitter(image_paths, doc_url, document_info)
+
                 handler.processed_docs["urls"].append(doc_url)
                 handler._save_processed_docs()
 

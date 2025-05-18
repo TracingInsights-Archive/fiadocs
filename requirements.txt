@@ -2,3 +2,4 @@ requests
 beautifulsoup4
 pdf2image
 atproto
+tweepy=="4.15.0"
