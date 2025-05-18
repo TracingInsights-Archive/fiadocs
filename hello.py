@@ -6,12 +6,11 @@ from datetime import datetime
 
 import pdf2image
 import requests
-import xapi  # Import the xapi.py module
 from atproto import Client
 from bs4 import BeautifulSoup
 
 # Global hashtags - Change in 2 places
-GLOBAL_HASHTAGS = "#f1 #formula1 #fia #ImolaGP"
+GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SaudiArabianGP"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -20,11 +19,11 @@ logging.basicConfig(
 
 class FIADocumentHandler:
     def __init__(self):
+        # self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season-2024-2290"
         self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season/season-2025-2071"
         self.download_dir = "downloads"
         self.processed_docs = self._load_processed_docs()
         self.bluesky_client = Client()
-        self.twitter_client = None  # Will be initialized during authentication
 
     def _load_processed_docs(self):
         try:
@@ -65,34 +64,6 @@ class FIADocumentHandler:
                 )
                 time.sleep(2**attempt)
 
-    def authenticate_twitter(
-        self, api_key, api_secret, access_token, access_token_secret, max_retries=3
-    ):
-        for attempt in range(max_retries):
-            try:
-                # Initialize Twitter client using xapi.py
-                self.twitter_client = xapi.TwitterClient(
-                    api_key, api_secret, access_token, access_token_secret
-                )
-                logging.info("Successfully authenticated with Twitter")
-                return
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                logging.warning(
-                    f"Twitter authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
-                )
-                time.sleep(2**attempt)
-
-    def _make_filename_readable(self, filename):
-        # Remove file extension
-        filename = os.path.splitext(filename)[0]
-        # Replace underscores and hyphens with spaces
-        filename = filename.replace("_", " ").replace("-", " ")
-        # Capitalize words
-        filename = " ".join(word.capitalize() for word in filename.split())
-        return filename
-
     def fetch_documents(self):
         logging.info(f"Fetching documents from {self.base_url}")
         headers = {
@@ -101,7 +72,9 @@ class FIADocumentHandler:
         response = requests.get(self.base_url, headers=headers)
         soup = BeautifulSoup(response.content, "html.parser")
         documents = []
-        document_info = {}
+        document_info = (
+            {}
+        )  # Store document metadata: {url: {"title": title, "published": date}}
 
         # Process document rows which contain title and published date
         doc_rows = soup.find_all("li", class_="document-row")
@@ -116,16 +89,24 @@ class FIADocumentHandler:
             filename = os.path.basename(normalized_url).lower()
 
             # Extract title from the document
-            title_div = row.find("div", class_="title")
-            title = title_div.text.strip() if title_div else ""
+            title_element = row.find("div", class_="field-name-title-field")
+            title = ""
+            if title_element:
+                title_item = title_element.find("div", class_="field-item")
+                if title_item:
+                    title = title_item.text.strip()
 
             # Extract published date
-            published_element = row.find("div", class_="published")
+            published_element = row.find(
+                "div", class_="field-name-field-published-date"
+            )
             published_date = ""
             if published_element:
-                date_span = published_element.find("span", class_="date-display-single")
-                if date_span:
-                    published_date = date_span.text.strip()
+                date_element = published_element.find(
+                    "span", class_="date-display-single"
+                )
+                if date_element:
+                    published_date = date_element.text.strip()
 
             # Store document metadata
             document_info[doc_url] = {"title": title, "published": published_date}
@@ -138,6 +119,49 @@ class FIADocumentHandler:
             ):
                 documents.append(doc_url)
                 self.processed_docs["filenames"].add(filename)
+
+        # Fallback to the original method if no documents found with the new approach
+        if not documents:
+            for link in soup.find_all("a"):
+                href = link.get("href", "")
+                if href.endswith(".pdf"):
+                    doc_url = (
+                        f"https://www.fia.com{href}" if href.startswith("/") else href
+                    )
+                    normalized_url = doc_url.strip().lower().replace("\\", "/")
+                    filename = os.path.basename(normalized_url).lower()
+                    if (
+                        normalized_url
+                        not in [url.lower() for url in self.processed_docs["urls"]]
+                        and filename not in self.processed_docs["filenames"]
+                        and doc_url not in documents
+                    ):
+                        documents.append(doc_url)
+                        self.processed_docs["filenames"].add(filename)
+
+            doc_containers = soup.find_all(
+                "div", class_=["document-listing", "document-container"]
+            )
+            for container in doc_containers:
+                pdf_links = container.find_all(
+                    "a", href=lambda x: x and x.endswith(".pdf")
+                )
+                for link in pdf_links:
+                    doc_url = (
+                        f"https://www.fia.com{link['href']}"
+                        if link["href"].startswith("/")
+                        else link["href"]
+                    )
+                    normalized_url = doc_url.strip().lower().replace("\\", "/")
+                    filename = os.path.basename(normalized_url).lower()
+                    if (
+                        normalized_url
+                        not in [url.lower() for url in self.processed_docs["urls"]]
+                        and filename not in self.processed_docs["filenames"]
+                        and doc_url not in documents
+                    ):
+                        documents.append(doc_url)
+                        self.processed_docs["filenames"].add(filename)
 
         return documents, document_info
 
@@ -170,30 +194,31 @@ class FIADocumentHandler:
         return datetime.now()
 
     def _parse_document_info(self, doc_url, doc_info=None):
-        if doc_info and doc_url in doc_info and doc_info[doc_url]["title"]:
+        if doc_info and doc_url in doc_info:
             info = doc_info[doc_url]
-            title = info["title"]
-            published_date = info["published"]
+            title = info.get("title", "")
+            published_date = info.get("published", "")
 
-            if not published_date.endswith("CET"):
-                published_date = f"{published_date} CET"
-            return title, published_date
+            if title and published_date:
+                # Add CET to the published date if it doesn't already have it
+                if not published_date.endswith("CET"):
+                    published_date = f"{published_date} CET"
+                return title, published_date
 
-        # Fallback to making filename human readable
+        # Fallback to original method
         filename = os.path.basename(doc_url)
-        readable_title = self._make_filename_readable(filename)
         doc_date = self._extract_timestamp_from_doc(doc_url)
         formatted_date = doc_date.strftime("%d.%m.%y %H:%M CET")
-        return readable_title, formatted_date
+        return filename, formatted_date
 
     def _get_current_gp_hashtag(self):
         f1_calendar = {
             "2024-02-29": "#BahrainGP",
-            "2024-03-07": "#ImolaGP",
+            "2024-03-07": "#SaudiArabianGP",
             "2024-03-21": "#AustralianGP",
             "2024-04-04": "#JapaneseGP",
             "2024-04-18": "#ChineseGP",
-            "2024-05-02": "#ImolaGP",
+            "2024-05-02": "#MiamiGP",
             "2024-05-16": "#EmiliaRomagnaGP",
             "2024-05-23": "#MonacoGP",
             "2024-06-06": "#CanadianGP",
@@ -257,7 +282,7 @@ class FIADocumentHandler:
             )
 
         # Make all hashtags clickable
-        all_tags = ["f1", "formula1", "fia", "ImolaGP"]
+        all_tags = ["f1", "formula1", "fia", "SaudiArabianGP"]
         for tag in all_tags:
             tag_with_hash = f"#{tag}"
             tag_pos = formatted_text.find(tag_with_hash)
@@ -306,69 +331,17 @@ class FIADocumentHandler:
                 root_post = {"uri": post_result.uri, "cid": post_result.cid}
                 parent_post = root_post
 
-    def post_to_twitter(self, image_paths, doc_url, doc_info=None):
-        if not self.twitter_client:
-            logging.warning("Twitter client not authenticated. Skipping Twitter post.")
-            return
-
-        doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
-        gp_hashtag = self._get_current_gp_hashtag()
-
-        max_title_length = 200
-        if len(doc_title) > max_title_length:
-            doc_title = doc_title[: max_title_length - 3] + "..."
-
-        all_hashtags = f"{GLOBAL_HASHTAGS}"
-        formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
-
-        # Twitter has a character limit, ensure we don't exceed it
-        max_tweet_length = 280
-        if len(formatted_text) + len(doc_url) + 1 <= max_tweet_length:
-            formatted_text += f"\n\n{doc_url}"
-
-        # Post initial tweet
-        previous_tweet_id = None
-
-        for i in range(0, len(image_paths), 4):
-            chunk = image_paths[i : i + 4]
-
-            if previous_tweet_id:
-                # This is a reply to the previous tweet
-                tweet_text = f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})"
-                tweet_id = self.twitter_client.post_tweet_with_media(
-                    tweet_text, chunk, reply_to_id=previous_tweet_id
-                )
-            else:
-                # This is the first tweet
-                tweet_id = self.twitter_client.post_tweet_with_media(
-                    formatted_text, chunk
-                )
-
-            previous_tweet_id = tweet_id
-            logging.info(f"Posted tweet {i//4 + 1}/{(len(image_paths) + 3)//4}")
-
 
 def main():
     logging.info("Starting FIA Document Handler")
     handler = FIADocumentHandler()
     try:
-        # Authenticate with Bluesky
         handler.authenticate_bluesky(
             os.environ["BLUESKY_USERNAME"],
             os.environ["BLUESKY_PASSWORD"],
             max_retries=3,
             timeout=30,
         )
-
-        # Authenticate with Twitter using xapi.py
-        handler.authenticate_twitter(
-            os.environ.get("TWITTER_API_KEY", ""),
-            os.environ.get("TWITTER_API_SECRET", ""),
-            os.environ.get("TWITTER_ACCESS_TOKEN", ""),
-            os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", ""),
-            max_retries=3,
-        )
-
         documents, document_info = handler.fetch_documents()
         unique_documents = list(dict.fromkeys(documents))
         logging.info(f"Found {len(unique_documents)} new documents to process")
@@ -383,14 +356,7 @@ def main():
                     continue
 
                 image_paths = handler.download_and_convert_pdf(doc_url)
-
-                # Post to Bluesky
                 handler.post_to_bluesky(image_paths, doc_url, document_info)
-
-                # Post to Twitter using xapi.py
-                if handler.twitter_client:
-                    handler.post_to_twitter(image_paths, doc_url, document_info)
-
                 handler.processed_docs["urls"].append(doc_url)
                 handler._save_processed_docs()
 
