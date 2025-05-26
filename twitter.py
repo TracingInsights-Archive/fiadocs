@@ -28,21 +28,16 @@ class TwitterAPIClient:
         self.client_id = client_id
         self.client_secret = client_secret
         self.access_token = None
+        self.refresh_token = None
         self.base_url = "https://api.x.com"
-        self.media_endpoint = "https://api.x.com/2/media/upload"
+        self.media_endpoint = "https://upload.twitter.com/1.1/media/upload.json"
         self.tweets_endpoint = "https://api.x.com/2/tweets"
 
     def authenticate_oauth2(self, redirect_uri="https://www.example.com"):
-        """Authenticate using OAuth 2.0 flow"""
+        """Authenticate using OAuth 2.0 flow with User Context"""
         try:
-            # Set the scopes
-            scopes = [
-                "media.write",
-                "users.read",
-                "tweet.read",
-                "tweet.write",
-                "offline.access",
-            ]
+            # Set the scopes for user context
+            scopes = ["tweet.read", "tweet.write", "users.read", "offline.access"]
 
             # Create a code verifier
             code_verifier = base64.urlsafe_b64encode(os.urandom(30)).decode("utf-8")
@@ -59,7 +54,7 @@ class TwitterAPIClient:
             )
 
             # Create authorization URL
-            auth_url = "https://x.com/i/oauth2/authorize"
+            auth_url = "https://twitter.com/i/oauth2/authorize"
             authorization_url, state = oauth.authorization_url(
                 auth_url, code_challenge=code_challenge, code_challenge_method="S256"
             )
@@ -71,25 +66,53 @@ class TwitterAPIClient:
             authorization_response = input("Paste the full callback URL: ")
 
             # Fetch access token
-            token_url = "https://api.x.com/2/oauth2/token"
+            token_url = "https://api.twitter.com/2/oauth2/token"
+
+            # Prepare token request
+            token_data = {
+                "grant_type": "authorization_code",
+                "client_id": self.client_id,
+                "code_verifier": code_verifier,
+                "redirect_uri": redirect_uri,
+            }
+
+            # Extract authorization code from callback URL
+            parsed_url = urllib.parse.urlparse(authorization_response)
+            auth_code = urllib.parse.parse_qs(parsed_url.query).get("code", [None])[0]
+
+            if not auth_code:
+                raise Exception("No authorization code found in callback URL")
+
+            token_data["code"] = auth_code
 
             # Use basic auth if client_secret is provided (confidential client)
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
             auth = None
             if self.client_secret:
                 from requests.auth import HTTPBasicAuth
 
                 auth = HTTPBasicAuth(self.client_id, self.client_secret)
+            else:
+                # For public clients, include client_id in the body
+                token_data["client_id"] = self.client_id
 
-            token = oauth.fetch_token(
-                token_url=token_url,
-                authorization_response=authorization_response,
+            response = requests.post(
+                token_url,
+                data=urllib.parse.urlencode(token_data),
+                headers=headers,
                 auth=auth,
-                client_id=self.client_id,
-                include_client_id=True,
-                code_verifier=code_verifier,
             )
 
+            if response.status_code != 200:
+                logging.error(
+                    f"Token request failed: {response.status_code} - {response.text}"
+                )
+                return False
+
+            token = response.json()
             self.access_token = token["access_token"]
+            self.refresh_token = token.get("refresh_token")
+
             logging.info("Successfully authenticated with Twitter API v2")
             return True
 
@@ -97,9 +120,56 @@ class TwitterAPIClient:
             logging.error(f"Error authenticating with Twitter: {str(e)}")
             return False
 
-    def set_access_token(self, access_token):
+    def set_access_token(self, access_token, refresh_token=None):
         """Set access token directly if you have it stored"""
         self.access_token = access_token
+        self.refresh_token = refresh_token
+
+    def refresh_access_token(self):
+        """Refresh the access token using refresh token"""
+        if not self.refresh_token:
+            logging.error("No refresh token available")
+            return False
+
+        try:
+            token_url = "https://api.twitter.com/2/oauth2/token"
+
+            token_data = {
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token,
+                "client_id": self.client_id,
+            }
+
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            auth = None
+            if self.client_secret:
+                from requests.auth import HTTPBasicAuth
+
+                auth = HTTPBasicAuth(self.client_id, self.client_secret)
+
+            response = requests.post(
+                token_url,
+                data=urllib.parse.urlencode(token_data),
+                headers=headers,
+                auth=auth,
+            )
+
+            if response.status_code == 200:
+                token = response.json()
+                self.access_token = token["access_token"]
+                if "refresh_token" in token:
+                    self.refresh_token = token["refresh_token"]
+                logging.info("Successfully refreshed Twitter access token")
+                return True
+            else:
+                logging.error(
+                    f"Token refresh failed: {response.status_code} - {response.text}"
+                )
+                return False
+
+        except Exception as e:
+            logging.error(f"Error refreshing token: {str(e)}")
+            return False
 
     def get_headers(self, content_type="application/json"):
         """Get headers for API requests"""
@@ -109,10 +179,10 @@ class TwitterAPIClient:
             "User-Agent": "FIADocumentBot/2.0",
         }
 
-    def upload_media_image(self, image_data):
-        """Upload image media using v2 API"""
+    def upload_media_v1(self, image_data):
+        """Upload media using Twitter API v1.1 (required for media uploads)"""
         try:
-            # For images, we can upload directly
+            # Use v1.1 endpoint for media upload
             files = {"media": ("image.jpg", image_data, "image/jpeg")}
 
             headers = {
@@ -120,45 +190,52 @@ class TwitterAPIClient:
                 "User-Agent": "FIADocumentBot/2.0",
             }
 
-            # Use form data for image upload
-            data = {"media_category": "tweet_image"}
+            response = requests.post(self.media_endpoint, files=files, headers=headers)
 
-            response = requests.post(
-                self.media_endpoint, files=files, data=data, headers=headers
-            )
-
-            if response.status_code == 200 or response.status_code == 201:
+            if response.status_code in [200, 201]:
                 result = response.json()
-                return result.get("data", {}).get("id") or result.get("media_id_string")
+                return result.get("media_id_string")
             else:
                 logging.error(
-                    f"Image upload failed: {response.status_code} - {response.text}"
+                    f"Media upload failed: {response.status_code} - {response.text}"
                 )
+                # Try to refresh token if we get 401
+                if response.status_code == 401 and self.refresh_token:
+                    logging.info("Attempting to refresh access token...")
+                    if self.refresh_access_token():
+                        # Retry upload with new token
+                        headers["Authorization"] = f"Bearer {self.access_token}"
+                        retry_response = requests.post(
+                            self.media_endpoint, files=files, headers=headers
+                        )
+                        if retry_response.status_code in [200, 201]:
+                            result = retry_response.json()
+                            return result.get("media_id_string")
                 return None
 
         except Exception as e:
-            logging.error(f"Error uploading image to Twitter: {str(e)}")
+            logging.error(f"Error uploading media to Twitter: {str(e)}")
             return None
 
-    def upload_media_chunked(
-        self, media_data, media_type="image/jpeg", media_category="tweet_image"
-    ):
-        """Upload media using chunked upload for larger files"""
+    def upload_media_chunked_v1(self, media_data, media_type="image/jpeg"):
+        """Upload media using chunked upload for larger files (v1.1 API)"""
         try:
-            # Step 1: Initialize upload
             total_bytes = len(media_data)
 
+            # Step 1: Initialize upload
             init_data = {
                 "command": "INIT",
                 "media_type": media_type,
                 "total_bytes": total_bytes,
-                "media_category": media_category,
             }
 
-            headers = self.get_headers()
+            headers = {
+                "Authorization": f"Bearer {self.access_token}",
+                "User-Agent": "FIADocumentBot/2.0",
+            }
 
             init_response = requests.post(
-                self.media_endpoint, params=init_data, headers=headers
+                self.media_endpoint, data=init_data, headers=headers
             )
 
             if init_response.status_code not in [200, 201]:
@@ -167,7 +244,7 @@ class TwitterAPIClient:
                 )
                 return None
 
-            media_id = init_response.json()["data"]["id"]
+            media_id = init_response.json()["media_id_string"]
             logging.info(f"Media upload initialized with ID: {media_id}")
 
             # Step 2: Upload chunks
@@ -186,13 +263,8 @@ class TwitterAPIClient:
                     "segment_index": segment_id,
                 }
 
-                chunk_headers = {
-                    "Authorization": f"Bearer {self.access_token}",
-                    "User-Agent": "FIADocumentBot/2.0",
-                }
-
                 append_response = requests.post(
-                    self.media_endpoint, data=data, files=files, headers=chunk_headers
+                    self.media_endpoint, data=data, files=files, headers=headers
                 )
 
                 if append_response.status_code not in [200, 201, 204]:
@@ -209,7 +281,7 @@ class TwitterAPIClient:
             finalize_data = {"command": "FINALIZE", "media_id": media_id}
 
             finalize_response = requests.post(
-                self.media_endpoint, params=finalize_data, headers=headers
+                self.media_endpoint, data=finalize_data, headers=headers
             )
 
             if finalize_response.status_code not in [200, 201]:
@@ -220,10 +292,11 @@ class TwitterAPIClient:
 
             # Check if processing is needed
             result = finalize_response.json()
-            processing_info = result.get("data", {}).get("processing_info")
+            processing_info = result.get("processing_info")
 
             if processing_info:
-                self._check_processing_status(media_id, processing_info)
+                if not self._check_processing_status_v1(media_id, processing_info):
+                    return None
 
             return media_id
 
@@ -231,8 +304,8 @@ class TwitterAPIClient:
             logging.error(f"Error in chunked media upload: {str(e)}")
             return None
 
-    def _check_processing_status(self, media_id, processing_info):
-        """Check media processing status"""
+    def _check_processing_status_v1(self, media_id, processing_info):
+        """Check media processing status for v1.1 API"""
         state = processing_info.get("state")
         logging.info(f"Media processing status: {state}")
 
@@ -249,16 +322,20 @@ class TwitterAPIClient:
 
         status_params = {"command": "STATUS", "media_id": media_id}
 
-        headers = self.get_headers()
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "User-Agent": "FIADocumentBot/2.0",
+        }
+
         status_response = requests.get(
             self.media_endpoint, params=status_params, headers=headers
         )
 
         if status_response.status_code == 200:
             result = status_response.json()
-            new_processing_info = result.get("data", {}).get("processing_info")
+            new_processing_info = result.get("processing_info")
             if new_processing_info:
-                return self._check_processing_status(media_id, new_processing_info)
+                return self._check_processing_status_v1(media_id, new_processing_info)
 
         return True
 
@@ -266,15 +343,12 @@ class TwitterAPIClient:
         """Upload media - tries simple upload first, falls back to chunked"""
         # For images under 5MB, try simple upload first
         if len(image_data) < 5 * 1024 * 1024 and media_type.startswith("image/"):
-            media_id = self.upload_media_image(image_data)
+            media_id = self.upload_media_v1(image_data)
             if media_id:
                 return media_id
 
         # Fall back to chunked upload
-        media_category = (
-            "tweet_image" if media_type.startswith("image/") else "tweet_video"
-        )
-        return self.upload_media_chunked(image_data, media_type, media_category)
+        return self.upload_media_chunked_v1(image_data, media_type)
 
     def post_tweet(self, text, media_ids=None, reply_to_tweet_id=None):
         """Post a tweet using v2 API"""
@@ -295,6 +369,21 @@ class TwitterAPIClient:
 
             if response.status_code == 201:
                 return response.json()["data"]
+            elif response.status_code == 401 and self.refresh_token:
+                # Try to refresh token and retry
+                logging.info("Attempting to refresh access token for tweet posting...")
+                if self.refresh_access_token():
+                    headers = self.get_headers()
+                    retry_response = requests.post(
+                        self.tweets_endpoint, json=tweet_data, headers=headers
+                    )
+                    if retry_response.status_code == 201:
+                        return retry_response.json()["data"]
+                    else:
+                        logging.error(
+                            f"Tweet post retry failed: {retry_response.status_code} - {retry_response.text}"
+                        )
+                        return None
             else:
                 logging.error(
                     f"Tweet post failed: {response.status_code} - {response.text}"
@@ -364,7 +453,7 @@ class FIADocumentHandler:
             return False
 
     def authenticate_twitter_oauth2(
-        self, client_id, client_secret=None, access_token=None
+        self, client_id, client_secret=None, access_token=None, refresh_token=None
     ):
         """Authenticate with Twitter using OAuth 2.0"""
         try:
@@ -372,7 +461,7 @@ class FIADocumentHandler:
 
             if access_token:
                 # Use existing access token
-                self.twitter_client.set_access_token(access_token)
+                self.twitter_client.set_access_token(access_token, refresh_token)
                 self.twitter_authenticated = True
                 logging.info("Successfully set Twitter access token")
                 return True
@@ -807,11 +896,17 @@ def main():
     twitter_access_token = os.environ.get(
         "TWITTER_ACCESS_TOKEN"
     )  # If you have a stored token
+    twitter_refresh_token = os.environ.get(
+        "TWITTER_REFRESH_TOKEN"
+    )  # If you have a refresh token
 
     if twitter_client_id:
         try:
             if handler.authenticate_twitter_oauth2(
-                twitter_client_id, twitter_client_secret, twitter_access_token
+                twitter_client_id,
+                twitter_client_secret,
+                twitter_access_token,
+                twitter_refresh_token,
             ):
                 platforms_available.append("Twitter")
             else:
