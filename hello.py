@@ -10,7 +10,7 @@ from atproto import Client
 from bs4 import BeautifulSoup
 
 # Global hashtags - Change in 2 places
-GLOBAL_HASHTAGS = "#f1 #formula1 #fia #MonacoGP"
+GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SpanishGP"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -168,13 +168,13 @@ class FIADocumentHandler:
     def _get_current_gp_hashtag(self):
         f1_calendar = {
             "2024-02-29": "#BahrainGP",
-            "2024-03-07": "#MonacoGP",
+            "2024-03-07": "#SpanishGP",
             "2024-03-21": "#AustralianGP",
             "2024-04-04": "#JapaneseGP",
             "2024-04-18": "#ChineseGP",
-            "2024-05-02": "#MonacoGP",
+            "2024-05-02": "#SpanishGP",
             "2024-05-16": "#EmiliaRomagnaGP",
-            "2024-05-23": "#MonacoGP",
+            "2024-05-23": "#SpanishGP",
             "2024-06-06": "#CanadianGP",
             "2024-06-20": "#SpanishGP",
             "2024-07-04": "#AustrianGP",
@@ -236,7 +236,7 @@ class FIADocumentHandler:
             )
 
         # Make all hashtags clickable
-        all_tags = ["f1", "formula1", "fia", "MonacoGP"]
+        all_tags = ["f1", "formula1", "fia", "SpanishGP"]
         for tag in all_tags:
             tag_with_hash = f"#{tag}"
             tag_pos = formatted_text.find(tag_with_hash)
