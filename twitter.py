@@ -1,243 +1,360 @@
-# import os
-# import json
-# import base64
-# import requests
-# import time
-# import logging
-# from requests_oauthlib import OAuth1
+import contextlib
+import logging
+import mimetypes
+import time
 
-# class TwitterAPI:
-#     def __init__(self, consumer_key, consumer_secret, access_token, access_token_secret):
-#         """
-#         Initialize the TwitterAPI with authentication credentials.
+import requests
+import tweepy
+from tweepy.auth import OAuth1UserHandler
+from tweepy.errors import (
+    BadRequest,
+    Forbidden,
+    HTTPException,
+    NotFound,
+    TooManyRequests,
+    TwitterServerError,
+    Unauthorized,
+)
+from tweepy.utils import list_to_csv
 
-#         Args:
-#             consumer_key (str): Your API/Consumer Key
-#             consumer_secret (str): Your API/Consumer Secret
-#             access_token (str): Your Access Token
-#             access_token_secret (str): Your Access Token Secret
-#         """
-#         self.consumer_key = consumer_key
-#         self.consumer_secret = consumer_secret
-#         self.access_token = access_token
-#         self.access_token_secret = access_token_secret
-#         self.auth = OAuth1(consumer_key, consumer_secret, access_token, access_token_secret)
-#         self.base_url = "https://api.twitter.com"
+logger = logging.getLogger(__name__)
 
-#     def upload_image_chunked(self, image_path, media_category="tweet_image"):
-#         """
-#         Upload an image using the chunked media upload endpoint.
 
-#         Args:
-#             image_path (str): Path to the image file
-#             media_category (str): Media category (default: tweet_image)
+# A custom v2 client so that we can implement the v2 media upload methods, missing in tweepy.
+class PostponeTweepyClientV2(tweepy.Client):
 
-#         Returns:
-#             str: Media ID if successful, None otherwise
-#         """
-#         try:
-#             # Check if file exists
-#             if not os.path.exists(image_path):
-#                 logging.error(f"Error: File {image_path} does not exist.")
-#                 return None
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-#             # Get file size
-#             file_size = os.path.getsize(image_path)
-#             logging.info(f"Uploading file {image_path} with size {file_size} bytes")
+    def request(
+        self,
+        method,
+        route,
+        params=None,
+        json=None,
+        files=None,
+        data=None,
+        headers=None,
+    ) -> requests.Response:
+        """
+        Adapted to accept `files`, `data` and `headers`, and remove `user_auth` flag. Originally:
+        https://github.com/tweepy/tweepy/blob/db28c0e84826485755eb7fcef0c30f75395dff5f/tweepy/client.py#L64  # noqa
+        """
+        host = "https://api.twitter.com"
 
-#             # Step 1: INIT - Initialize the upload
-#             init_url = f"{self.base_url}/1.1/media/upload.json"
-#             init_params = {
-#                 "command": "INIT",
-#                 "total_bytes": file_size,
-#                 "media_type": self._get_media_type(image_path),
-#                 "media_category": media_category
-#             }
+        if headers is None:
+            headers = {}
+        headers["User-Agent"] = self.user_agent
 
-#             logging.info(f"Initializing upload with params: {init_params}")
-#             init_response = requests.post(init_url, auth=self.auth, data=init_params)
+        auth = OAuth1UserHandler(
+            self.consumer_key,
+            self.consumer_secret,
+            self.access_token,
+            self.access_token_secret,
+        )
+        auth = auth.apply_auth()
 
-#             if init_response.status_code != 200:
-#                 logging.error(f"Error initializing upload: Status {init_response.status_code}, Response: {init_response.text}")
-#                 return None
+        logger.debug(
+            f"Making API request: {method} {host + route}\n"
+            f"Parameters: {params}\n"
+            f"Headers: {headers}\n"
+            f"Body: {json}"
+        )
 
-#             media_id = init_response.json()["media_id_string"]
-#             logging.info(f"Upload initialized with media_id: {media_id}")
+        with self.session.request(
+            method,
+            host + route,
+            params=params,
+            json=json,
+            headers=headers,
+            auth=auth,
+            files=files,
+            data=data,
+        ) as response:
+            logger.debug(
+                "Received API response: "
+                f"{response.status_code} {response.reason}\n"
+                f"Headers: {response.headers}\n"
+                f"Content: {response.content}"
+            )
 
-#             # Step 2: APPEND - Upload the file in chunks
-#             chunk_size = 4 * 1024 * 1024  # 4MB chunks
-#             segment_index = 0
+            if response.status_code == 400:
+                raise BadRequest(response)
+            if response.status_code == 401:
+                raise Unauthorized(response)
+            if response.status_code == 403:
+                raise Forbidden(response)
+            if response.status_code == 404:
+                raise NotFound(response)
+            if response.status_code == 429:
+                if self.wait_on_rate_limit:
+                    reset_time = int(response.headers["x-rate-limit-reset"])
+                    sleep_time = reset_time - int(time.time()) + 1
+                    if sleep_time > 0:
+                        logger.warning(
+                            f"Rate limit exceeded. Sleeping for {sleep_time} seconds."
+                        )
+                        time.sleep(sleep_time)
+                    return self.request(
+                        method, route, params, json, files, data, headers
+                    )
+                else:
+                    raise TooManyRequests(response)
+            if response.status_code >= 500:
+                raise TwitterServerError(response)
+            if not 200 <= response.status_code < 300:
+                raise HTTPException(response)
 
-#             with open(image_path, "rb") as image_file:
-#                 while True:
-#                     chunk = image_file.read(chunk_size)
-#                     if not chunk:
-#                         break
+            return response
 
-#                     append_url = f"{self.base_url}/1.1/media/upload.json"
-#                     append_params = {
-#                         "command": "APPEND",
-#                         "media_id": media_id,
-#                         "segment_index": segment_index
-#                     }
+    def media_upload(
+        self,
+        filename,
+        *,
+        file=None,
+        chunked=False,
+        media_category=None,
+        additional_owners=None,
+        **kwargs,
+    ) -> dict:
+        file_type = None
+        try:
+            import imghdr
+        except ModuleNotFoundError:
+            # imghdr was removed in Python 3.13
+            pass
+        else:
+            h = None
+            if file is not None:
+                location = file.tell()
+                h = file.read(32)
+                file.seek(location)
+            file_type = imghdr.what(filename, h=h)
+            if file_type is not None:
+                file_type = "image/" + file_type
+        if file_type is None:
+            file_type = mimetypes.guess_type(filename)[0]
 
-#                     files = {"media": chunk}
-#                     append_response = requests.post(append_url, auth=self.auth, data=append_params, files=files)
+        if chunked or file_type.startswith("video/"):
+            return self.chunked_upload(
+                filename,
+                file=file,
+                file_type=file_type,
+                media_category=media_category,
+                additional_owners=additional_owners,
+                **kwargs,
+            )
+        else:
+            return self.simple_upload(
+                filename,
+                file=file,
+                media_category=media_category,
+                additional_owners=additional_owners,
+                **kwargs,
+            )
 
-#                     if append_response.status_code != 204:
-#                         logging.error(f"Error appending chunk {segment_index}: Status {append_response.status_code}, Response: {append_response.text}")
-#                         return None
+    def simple_upload(
+        self,
+        filename,
+        *,
+        file=None,
+        media_category=None,
+        additional_owners=None,
+        **kwargs,
+    ) -> dict:
+        """
+        Simple upload is used for uploading images.
 
-#                     segment_index += 1
-#                     logging.info(f"Uploaded chunk {segment_index} of {image_path}")
+        Returns a dict like this:
+        {
+            'id': '1899873475323076485',
+            'size': 10146,
+            'expires_after_secs': 86400,
+            'image': {'image_type': 'image/jpeg', 'w': 153, 'h': 164},
+        }
+        """
+        with contextlib.ExitStack() as stack:
+            if file is not None:
+                files = {"media": (filename, file)}
+            else:
+                files = {"media": stack.enter_context(open(filename, "rb"))}
 
-#             # Step 3: FINALIZE - Complete the upload
-#             finalize_url = f"{self.base_url}/1.1/media/upload.json"
-#             finalize_params = {
-#                 "command": "FINALIZE",
-#                 "media_id": media_id
-#             }
+            post_data = {}
+            if media_category is not None:
+                post_data["media_category"] = media_category
+            if additional_owners is not None:
+                post_data["additional_owners"] = additional_owners
 
-#             finalize_response = requests.post(finalize_url, auth=self.auth, data=finalize_params)
+            response = self.request(
+                "POST",
+                "/2/media/upload",
+                json=post_data,
+                files=files,
+                **kwargs,
+            )
+            # For simple uploads, the response does not have the 'data' key.
+            # The media data as top-level keys instead.
+            return response.json()
 
-#             if finalize_response.status_code != 200:
-#                 logging.error(f"Error finalizing upload: Status {finalize_response.status_code}, Response: {finalize_response.text}")
-#                 return None
+    def chunked_upload(
+        self,
+        filename,
+        *,
+        file=None,
+        file_type=None,
+        wait_for_async_finalize=True,
+        media_category=None,
+        additional_owners=None,
+        **kwargs,
+    ) -> dict:
+        """
+        Chunked upload is used for uploading videos.
 
-#             finalize_data = finalize_response.json()
-#             logging.info(f"Upload finalized: {finalize_data}")
+        Returns a dict like this:
+        {
+            'id': '1899886362481818476',
+            'media_key': '7_1899886362481818476',
+            'size': 14568664,
+            'expires_after_secs': 86398,
+            'video': {
+                'video_type': 'video/mp4',
+            },
+            'processing_info': {
+                'progress_percent': 100,
+                'state': 'succeeded',
+            },
+        }
+        """
+        fp = file or open(filename, "rb")
 
-#             # Check if processing is needed
-#             if "processing_info" in finalize_data:
-#                 media_id = self._wait_for_processing(media_id, finalize_data["processing_info"])
+        start = fp.tell()
+        fp.seek(0, 2)  # Seek to end of file
+        file_size = fp.tell() - start
+        fp.seek(start)
 
-#             logging.info(f"Successfully uploaded image {image_path} with media_id: {media_id}")
-#             return media_id
+        min_chunk_size, remainder = divmod(file_size, 1000)
+        min_chunk_size += bool(remainder)
 
-#         except Exception as e:
-#             logging.error(f"Exception during image upload for {image_path}: {str(e)}")
-#             import traceback
-#             logging.error(f"Traceback: {traceback.format_exc()}")
-#             return None
+        # Use 1 MiB as default chunk size
+        chunk_size = kwargs.pop("chunk_size", 1024 * 1024)
+        # Max chunk size is 5 MiB
+        chunk_size = max(min(chunk_size, 5 * 1024 * 1024), min_chunk_size)
 
-#     def _wait_for_processing(self, media_id, processing_info):
-#         """
-#         Wait for media processing to complete.
+        segments, remainder = divmod(file_size, chunk_size)
+        segments += bool(remainder)
 
-#         Args:
-#             media_id (str): Media ID
-#             processing_info (dict): Processing info from FINALIZE response
+        response = self.chunked_upload_init(
+            file_size,
+            file_type,
+            media_category=media_category,
+            additional_owners=additional_owners,
+            **kwargs,
+        )
+        media_data = response.json().get("data", {})
+        media_id = media_data.get("id")
 
-#         Returns:
-#             str: Media ID if successful, None otherwise
-#         """
-#         try:
-#             state = processing_info.get("state")
-#             logging.info(f"Media processing state: {state}")
+        for segment_index in range(segments):
+            # The APPEND command returns an empty response body
+            self.chunked_upload_append(
+                media_id, (filename, fp.read(chunk_size)), segment_index, **kwargs
+            )
 
-#             while state == "pending" or state == "in_progress":
-#                 check_after_secs = processing_info.get("check_after_secs", 1)
-#                 logging.info(f"Media processing in progress. Waiting {check_after_secs} seconds...")
-#                 time.sleep(check_after_secs)
+        fp.close()
 
-#                 # Check status
-#                 status_url = f"{self.base_url}/1.1/media/upload.json"
-#                 status_params = {
-#                     "command": "STATUS",
-#                     "media_id": media_id
-#                 }
+        response = self.chunked_upload_finalize(media_id, **kwargs)
+        media_data = response.json().get("data", {})
+        media_id = media_data.get("id")
 
-#                 status_response = requests.get(status_url, auth=self.auth, params=status_params)
+        if wait_for_async_finalize and media_data.get("processing_info"):
+            while (
+                media_data["processing_info"]["state"] in ("pending", "in_progress")
+                and "error" not in media_data["processing_info"]
+            ):
+                time.sleep(media_data["processing_info"]["check_after_secs"])
+                response = self.get_media_upload_status(media_id, **kwargs)
+                media_data = response.json().get("data", {})
 
-#                 if status_response.status_code != 200:
-#                     logging.error(f"Error checking media status: Status {status_response.status_code}, Response: {status_response.text}")
-#                     return None
+        return media_data
 
-#                 processing_info = status_response.json().get("processing_info", {})
-#                 state = processing_info.get("state")
-#                 logging.info(f"Updated processing state: {state}")
+    def chunked_upload_append(
+        self, media_id, media, segment_index, **kwargs
+    ) -> requests.Response:
+        post_data = {
+            "command": "APPEND",
+            "media_id": media_id,
+            "segment_index": segment_index,
+        }
+        files = {"media": media}
+        return self.request(
+            "POST", "/2/media/upload", data=post_data, files=files, **kwargs
+        )
 
-#                 if state == "failed":
-#                     error_info = processing_info.get("error", {})
-#                     logging.error(f"Media processing failed: {error_info}")
-#                     return None
+    def chunked_upload_finalize(self, media_id, **kwargs) -> requests.Response:
+        post_data = {
+            "command": "FINALIZE",
+            "media_id": media_id,
+        }
 
-#             return media_id
+        return self.request(
+            "POST",
+            "/2/media/upload",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=post_data,
+            **kwargs,
+        )
 
-#         except Exception as e:
-#             logging.error(f"Exception during processing wait: {str(e)}")
-#             return None
+    def chunked_upload_init(
+        self,
+        total_bytes,
+        media_type,
+        *,
+        media_category=None,
+        additional_owners=None,
+        **kwargs,
+    ) -> requests.Response:
+        post_data = {
+            "command": "INIT",
+            "total_bytes": total_bytes,
+            "media_type": media_type,
+        }
+        if media_category is not None:
+            post_data["media_category"] = media_category
+        if additional_owners is not None:
+            post_data["additional_owners"] = list_to_csv(additional_owners)
 
-#     def post_tweet_with_media(self, text, media_ids):
-#         """
-#         Post a tweet with media.
+        return self.request(
+            "POST",
+            "/2/media/upload",
+            data=post_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            **kwargs,
+        )
 
-#         Args:
-#             text (str): Tweet text
-#             media_ids (list): List of media IDs to attach
+    def get_media_upload_status(self, media_id, **kwargs) -> requests.Response:
+        return self.request(
+            "GET",
+            "/2/media/upload",
+            params={
+                "command": "STATUS",
+                "media_id": media_id,
+            },
+            **kwargs,
+        )
 
-#         Returns:
-#             dict: Tweet data if successful, None otherwise
-#         """
-#         try:
-#             tweet_url = f"{self.base_url}/2/tweets"
+    def create_media_metadata(self, media_id, alt_text, **kwargs) -> requests.Response:
+        payload = {
+            "id": media_id,
+            "metadata": {
+                "alt_text": {
+                    "text": alt_text,
+                }
+            },
+        }
 
-#             # Convert list of media_ids to list format for API v2
-#             if isinstance(media_ids, str):
-#                 media_ids = [media_ids]
-#             elif isinstance(media_ids, list) and len(media_ids) == 1 and "," in media_ids[0]:
-#                 # Handle comma-separated string in list
-#                 media_ids = media_ids[0].split(",")
-
-#             payload = {
-#                 "text": text,
-#                 "media": {"media_ids": media_ids}
-#             }
-
-#             headers = {
-#                 "Content-Type": "application/json"
-#             }
-
-#             logging.info(f"Posting tweet with payload: {payload}")
-#             response = requests.post(
-#                 tweet_url,
-#                 auth=self.auth,
-#                 headers=headers,
-#                 json=payload
-#             )
-
-#             if response.status_code != 201:
-#                 logging.error(f"Error posting tweet: Status {response.status_code}, Response: {response.text}")
-#                 return None
-
-#             result = response.json()
-#             logging.info(f"Tweet posted successfully: {result}")
-#             return result
-
-#         except Exception as e:
-#             logging.error(f"Exception during tweet posting: {str(e)}")
-#             import traceback
-#             logging.error(f"Traceback: {traceback.format_exc()}")
-#             return None
-
-#     def _get_media_type(self, file_path):
-#         """
-#         Get the media type based on file extension.
-
-#         Args:
-#             file_path (str): Path to the media file
-
-#         Returns:
-#             str: Media type
-#         """
-#         extension = os.path.splitext(file_path)[1].lower()
-
-#         media_types = {
-#             ".jpg": "image/jpeg",
-#             ".jpeg": "image/jpeg",
-#             ".png": "image/png",
-#             ".gif": "image/gif",
-#             ".mp4": "video/mp4"
-#         }
-
-#         return media_types.get(extension, "application/octet-stream")
+        return self.request(
+            "POST",
+            "/2/media/metadata",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            **kwargs,
+        )
