@@ -476,8 +476,8 @@ def main():
         # Authenticate with Bluesky
         handler.authenticate_bluesky(
             os.environ["BLUESKY_USERNAME"],
-            os.environ["BLUESKY_USERNAME"],
-            # os.environ["BLUESKY_PASSWORD"],
+            # os.environ["BLUESKY_USERNAME"],
+            os.environ["BLUESKY_PASSWORD"],
             max_retries=3,
             timeout=30,
         )
