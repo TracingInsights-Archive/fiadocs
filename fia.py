@@ -2,13 +2,14 @@ import json
 import logging
 import os
 import time
+import base64
 from datetime import datetime
 
 import pdf2image
 import requests
 from atproto import Client
 from bs4 import BeautifulSoup
-from twitter import TwitterAPI
+from requests_oauthlib import OAuth1
 
 # Global hashtags - Change in 2 places
 GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SpanishGP"
@@ -18,6 +19,210 @@ logging.basicConfig(
 )
 
 
+class TwitterAPI:
+    def __init__(self, consumer_key, consumer_secret, access_token, access_token_secret):
+        """
+        Initialize the TwitterAPI with authentication credentials.
+
+        Args:
+            consumer_key (str): Your API/Consumer Key
+            consumer_secret (str): Your API/Consumer Secret
+            access_token (str): Your Access Token
+            access_token_secret (str): Your Access Token Secret
+        """
+        self.consumer_key = consumer_key
+        self.consumer_secret = consumer_secret
+        self.access_token = access_token
+        self.access_token_secret = access_token_secret
+        self.auth = OAuth1(consumer_key, consumer_secret, access_token, access_token_secret)
+        self.base_url = "https://api.twitter.com"
+
+    def upload_image_chunked(self, image_path, media_category="tweet_image"):
+        """
+        Upload an image using the chunked media upload endpoint.
+
+        Args:
+            image_path (str): Path to the image file
+            media_category (str): Media category (default: tweet_image)
+
+        Returns:
+            str: Media ID if successful, None otherwise
+        """
+        # Check if file exists
+        if not os.path.exists(image_path):
+            logging.error(f"Error: File {image_path} does not exist.")
+            return None
+
+        # Get file size
+        file_size = os.path.getsize(image_path)
+
+        # Step 1: INIT - Initialize the upload
+        init_url = f"{self.base_url}/1.1/media/upload.json"
+        init_params = {
+            "command": "INIT",
+            "total_bytes": file_size,
+            "media_type": self._get_media_type(image_path),
+            "media_category": media_category
+        }
+
+        init_response = requests.post(init_url, auth=self.auth, data=init_params)
+
+        if init_response.status_code != 200:
+            logging.error(f"Error initializing upload: {init_response.text}")
+            return None
+
+        media_id = init_response.json()["media_id_string"]
+
+        # Step 2: APPEND - Upload the file in chunks
+        chunk_size = 4 * 1024 * 1024  # 4MB chunks
+        segment_index = 0
+
+        with open(image_path, "rb") as image_file:
+            while True:
+                chunk = image_file.read(chunk_size)
+                if not chunk:
+                    break
+
+                append_url = f"{self.base_url}/1.1/media/upload.json"
+                append_params = {
+                    "command": "APPEND",
+                    "media_id": media_id,
+                    "segment_index": segment_index
+                }
+
+                files = {"media": chunk}
+                append_response = requests.post(append_url, auth=self.auth, data=append_params, files=files)
+
+                if append_response.status_code != 204:
+                    logging.error(f"Error appending chunk {segment_index}: {append_response.text}")
+                    return None
+
+                segment_index += 1
+                logging.info(f"Uploaded chunk {segment_index} of {image_path} to Twitter")
+
+        # Step 3: FINALIZE - Complete the upload
+        finalize_url = f"{self.base_url}/1.1/media/upload.json"
+        finalize_params = {
+            "command": "FINALIZE",
+            "media_id": media_id
+        }
+
+        finalize_response = requests.post(finalize_url, auth=self.auth, data=finalize_params)
+
+        if finalize_response.status_code != 200:
+            logging.error(f"Error finalizing upload: {finalize_response.text}")
+            return None
+
+        finalize_data = finalize_response.json()
+
+        # Check if processing is needed
+        if "processing_info" in finalize_data:
+            media_id = self._wait_for_processing(media_id, finalize_data["processing_info"])
+
+        return media_id
+
+    def _wait_for_processing(self, media_id, processing_info):
+        """
+        Wait for media processing to complete.
+
+        Args:
+            media_id (str): Media ID
+            processing_info (dict): Processing info from FINALIZE response
+
+        Returns:
+            str: Media ID if successful, None otherwise
+        """
+        state = processing_info.get("state")
+
+        while state == "pending" or state == "in_progress":
+            check_after_secs = processing_info.get("check_after_secs", 1)
+            logging.info(f"Twitter media processing in progress. Waiting {check_after_secs} seconds...")
+            time.sleep(check_after_secs)
+
+            # Check status
+            status_url = f"{self.base_url}/1.1/media/upload.json"
+            status_params = {
+                "command": "STATUS",
+                "media_id": media_id
+            }
+
+            status_response = requests.get(status_url, auth=self.auth, params=status_params)
+
+            if status_response.status_code != 200:
+                logging.error(f"Error checking media status: {status_response.text}")
+                return None
+
+            processing_info = status_response.json().get("processing_info", {})
+            state = processing_info.get("state")
+
+            if state == "failed":
+                logging.error(f"Twitter media processing failed: {processing_info.get('error')}")
+                return None
+
+        return media_id
+
+    def post_tweet_with_media(self, text, media_ids):
+        """
+        Post a tweet with media.
+
+        Args:
+            text (str): Tweet text
+            media_ids (list): List of media IDs to attach
+
+        Returns:
+            dict: Tweet data if successful, None otherwise
+        """
+        tweet_url = f"{self.base_url}/2/tweets"
+
+        # Ensure media_ids is a list
+        if not isinstance(media_ids, list):
+            media_ids = [media_ids]
+
+        payload = {
+            "text": text,
+            "media": {"media_ids": media_ids}
+        }
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(
+            tweet_url,
+            auth=self.auth,
+            headers=headers,
+            json=payload
+        )
+
+        if response.status_code != 201:
+            logging.error(f"Error posting tweet: {response.text}")
+            return None
+
+        return response.json()
+
+    def _get_media_type(self, file_path):
+        """
+        Get the media type based on file extension.
+
+        Args:
+            file_path (str): Path to the media file
+
+        Returns:
+            str: Media type
+        """
+        extension = os.path.splitext(file_path)[1].lower()
+
+        media_types = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".mp4": "video/mp4"
+        }
+
+        return media_types.get(extension, "application/octet-stream")
+
+
 class FIADocumentHandler:
     def __init__(self):
         self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season/season-2025-2071"
@@ -25,8 +230,6 @@ class FIADocumentHandler:
         self.processed_docs = self._load_processed_docs()
         self.bluesky_client = Client()
         self.twitter_client = None
-        self.bluesky_authenticated = False
-        self.twitter_authenticated = False
 
     def _load_processed_docs(self):
         try:
@@ -53,33 +256,29 @@ class FIADocumentHandler:
             json.dump(self.processed_docs["urls"], f)
 
     def authenticate_bluesky(self, username, password, max_retries=3, timeout=30):
-        try:
-            for attempt in range(max_retries):
-                try:
-                    self.bluesky_client = Client()
-                    self.bluesky_client.login(username, password)
-                    logging.info("Successfully authenticated with Bluesky")
-                    self.bluesky_authenticated = True
-                    return
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise
-                    logging.warning(
-                        f"Bluesky authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
-                    )
-                    time.sleep(2**attempt)
-        except Exception as e:
-            logging.error(f"Failed to authenticate with Bluesky: {str(e)}")
-            self.bluesky_authenticated = False
+        for attempt in range(max_retries):
+            try:
+                self.bluesky_client = Client()
+                self.bluesky_client.login(username, password)
+                logging.info("Successfully authenticated with Bluesky")
+                return
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                logging.warning(
+                    f"Authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
 
     def authenticate_twitter(self, consumer_key, consumer_secret, access_token, access_token_secret):
         try:
-            self.twitter_client = TwitterAPI(consumer_key, consumer_secret, access_token, access_token_secret)
-            logging.info("Successfully authenticated with Twitter")
-            self.twitter_authenticated = True
+            self.twitter_client = TwitterAPI(
+                consumer_key, consumer_secret, access_token, access_token_secret
+            )
+            logging.info("Successfully initialized Twitter API client")
         except Exception as e:
-            logging.error(f"Failed to authenticate with Twitter: {str(e)}")
-            self.twitter_authenticated = False
+            logging.error(f"Failed to initialize Twitter API client: {str(e)}")
+            raise
 
     def _make_filename_readable(self, filename):
         # Remove file extension
@@ -220,241 +419,166 @@ class FIADocumentHandler:
         return future_races[next_race_date]
 
     def post_to_bluesky(self, image_paths, doc_url, doc_info=None):
-        if not self.bluesky_authenticated:
-            logging.warning("Bluesky not authenticated, skipping Bluesky post")
-            return False
+        doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+        gp_hashtag = self._get_current_gp_hashtag()
 
-        try:
-            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
-            gp_hashtag = self._get_current_gp_hashtag()
+        max_title_length = 200
+        if len(doc_title) > max_title_length:
+            doc_title = doc_title[: max_title_length - 3] + "..."
 
-            max_title_length = 200
-            if len(doc_title) > max_title_length:
-                doc_title = doc_title[: max_title_length - 3] + "..."
+        all_hashtags = f"{GLOBAL_HASHTAGS}"
+        formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
 
-            all_hashtags = f"{GLOBAL_HASHTAGS}"
-            formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+        if len(formatted_text) + len(doc_url) + 1 <= 300:
+            formatted_text += f"\n\n{doc_url}"
 
-            if len(formatted_text) + len(doc_url) + 1 <= 300:
-                formatted_text += f"\n\n{doc_url}"
+        encoded_doc_url = requests.utils.quote(doc_url, safe=":/?=")
+        facets = []
 
-            encoded_doc_url = requests.utils.quote(doc_url, safe=":/?=")
-            facets = []
+        # Add URL facet
+        url_start = formatted_text.find(doc_url)
+        if url_start != -1:
+            byte_start = len(formatted_text[:url_start].encode("utf-8"))
+            byte_end = len(formatted_text[: url_start + len(doc_url)].encode("utf-8"))
+            facets.append(
+                {
+                    "index": {"byteStart": byte_start, "byteEnd": byte_end},
+                    "features": [
+                        {
+                            "$type": "app.bsky.richtext.facet#link",
+                            "uri": encoded_doc_url,
+                        }
+                    ],
+                }
+            )
 
-            # Add URL facet
-            url_start = formatted_text.find(doc_url)
-            if url_start != -1:
-                byte_start = len(formatted_text[:url_start].encode("utf-8"))
-                byte_end = len(formatted_text[: url_start + len(doc_url)].encode("utf-8"))
+        # Make all hashtags clickable
+        all_tags = ["f1", "formula1", "fia", "SpanishGP"]
+        for tag in all_tags:
+            tag_with_hash = f"#{tag}"
+            tag_pos = formatted_text.find(tag_with_hash)
+            if tag_pos != -1:
+                byte_start = len(formatted_text[:tag_pos].encode("utf-8"))
+                byte_end = len(
+                    formatted_text[: tag_pos + len(tag_with_hash)].encode("utf-8")
+                )
                 facets.append(
                     {
                         "index": {"byteStart": byte_start, "byteEnd": byte_end},
                         "features": [
-                            {
-                                "$type": "app.bsky.richtext.facet#link",
-                                "uri": encoded_doc_url,
-                            }
+                            {"$type": "app.bsky.richtext.facet#tag", "tag": tag}
                         ],
                     }
                 )
 
-            # Make all hashtags clickable
-            all_tags = ["f1", "formula1", "fia", "SpanishGP"]
-            for tag in all_tags:
-                tag_with_hash = f"#{tag}"
-                tag_pos = formatted_text.find(tag_with_hash)
-                if tag_pos != -1:
-                    byte_start = len(formatted_text[:tag_pos].encode("utf-8"))
-                    byte_end = len(
-                        formatted_text[: tag_pos + len(tag_with_hash)].encode("utf-8")
-                    )
-                    facets.append(
-                        {
-                            "index": {"byteStart": byte_start, "byteEnd": byte_end},
-                            "features": [
-                                {"$type": "app.bsky.richtext.facet#tag", "tag": tag}
-                            ],
-                        }
-                    )
+        root_post = None
+        parent_post = None
 
-            root_post = None
-            parent_post = None
+        for i in range(0, len(image_paths), 4):
+            chunk = image_paths[i : i + 4]
+            images = {"$type": "app.bsky.embed.images", "images": []}
 
-            for i in range(0, len(image_paths), 4):
-                chunk = image_paths[i : i + 4]
-                images = {"$type": "app.bsky.embed.images", "images": []}
+            for img_path in chunk:
+                with open(img_path, "rb") as f:
+                    image_data = f.read()
+                response = self.bluesky_client.upload_blob(image_data)
+                images["images"].append({"image": response.blob, "alt": doc_title})
 
-                for img_path in chunk:
-                    with open(img_path, "rb") as f:
-                        image_data = f.read()
-                    response = self.bluesky_client.upload_blob(image_data)
-                    images["images"].append({"image": response.blob, "alt": doc_title})
+            if parent_post:
+                reply = {
+                    "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
+                    "parent": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
+                }
+                post_result = self.bluesky_client.post(
+                    text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
+                    embed=images,
+                    reply_to=reply,
+                )
+                parent_post = {"uri": post_result.uri, "cid": post_result.cid}
+            else:
+                post_result = self.bluesky_client.post(
+                    text=formatted_text, facets=facets, embed=images
+                )
+                root_post = {"uri": post_result.uri, "cid": post_result.cid}
+                parent_post = root_post
 
-                if parent_post:
-                    reply = {
-                        "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
-                        "parent": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
-                    }
-                    post_result = self.bluesky_client.post(
-                        text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
-                        embed=images,
-                        reply_to=reply,
-                    )
-                    parent_post = {"uri": post_result.uri, "cid": post_result.cid}
-                else:
-                    post_result = self.bluesky_client.post(
-                        text=formatted_text, facets=facets, embed=images
-                    )
-                    root_post = {"uri": post_result.uri, "cid": post_result.cid}
-                    parent_post = root_post
-
-            logging.info("Successfully posted to Bluesky")
-            return True
-
-        except Exception as e:
-            logging.error(f"Error posting to Bluesky: {str(e)}")
-            return False
+        logging.info(f"Successfully posted to Bluesky: {doc_title}")
 
     def post_to_twitter(self, image_paths, doc_url, doc_info=None):
-        if not self.twitter_authenticated:
-            logging.warning("Twitter not authenticated, skipping Twitter post")
-            return False
+        if not self.twitter_client:
+            logging.warning("Twitter client not initialized. Skipping Twitter post.")
+            return
 
-        try:
-            logging.info(f"Starting Twitter post for {len(image_paths)} images")
-            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+        doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+        gp_hashtag = self._get_current_gp_hashtag()
 
-            max_title_length = 150
-            if len(doc_title) > max_title_length:
-                doc_title = doc_title[: max_title_length - 3] + "..."
+        # Twitter has a 280 character limit
+        max_title_length = 150
+        if len(doc_title) > max_title_length:
+            doc_title = doc_title[: max_title_length - 3] + "..."
 
-            all_hashtags = f"{GLOBAL_HASHTAGS}"
-            formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+        all_hashtags = f"{GLOBAL_HASHTAGS}"
+        formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
 
-            if len(formatted_text) + len(doc_url) + 1 <= 270:
-                formatted_text += f"\n\n{doc_url}"
+        # Add URL if there's room
+        if len(formatted_text) + len(doc_url) + 1 <= 280:
+            formatted_text += f"\n\n{doc_url}"
 
-            success_count = 0
+        # Twitter allows up to 4 images per tweet
+        tweet_id = None
+        for i in range(0, len(image_paths), 4):
+            chunk = image_paths[i : i + 4]
+            media_ids = []
 
-            # Process images in chunks of 4 (Twitter's limit)
-            for i in range(0, len(image_paths), 4):
-                chunk = image_paths[i : i + 4]
-                chunk_media_ids = []
+            # Upload each image in the chunk
+            for img_path in chunk:
+                media_id = self.twitter_client.upload_image_chunked(img_path)
+                if media_id:
+                    media_ids.append(media_id)
 
-                logging.info(f"Processing chunk {i//4 + 1} with {len(chunk)} images")
-
-                for img_path in chunk:
-                    logging.info(f"Uploading image: {img_path}")
-                    media_id = self.twitter_client.upload_image_chunked(img_path)
-                    if media_id:
-                        chunk_media_ids.append(media_id)
-                        logging.info(f"Successfully uploaded image, media_id: {media_id}")
-                    else:
-                        logging.error(f"Failed to upload image {img_path} to Twitter")
-
-                if chunk_media_ids:
-                    if i == 0:
-                        tweet_text = formatted_text
-                    else:
-                        tweet_text = f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})\n\n{all_hashtags}"
-
-                    logging.info(f"Posting tweet with {len(chunk_media_ids)} media items")
-                    tweet_result = self.twitter_client.post_tweet_with_media(tweet_text, chunk_media_ids)
-                    if tweet_result:
-                        logging.info(f"Successfully posted Twitter thread part {i//4 + 1}")
-                        success_count += 1
-                    else:
-                        logging.error(f"Failed to post Twitter thread part {i//4 + 1}")
+            # If we have media IDs, post the tweet
+            if media_ids:
+                if tweet_id is None:
+                    # First tweet with the full text
+                    tweet_text = formatted_text
                 else:
-                    logging.error(f"No media uploaded for Twitter chunk {i//4 + 1}")
+                    # Follow-up tweets as replies to the first one
+                    tweet_text = f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})"
 
-            if success_count > 0:
-                logging.info(f"Successfully posted {success_count} Twitter posts")
-                return True
-            else:
-                logging.error("Failed to post any Twitter content")
-                return False
+                tweet_result = self.twitter_client.post_tweet_with_media(tweet_text, media_ids)
+                if tweet_result:
+                    if tweet_id is None:
+                        tweet_id = tweet_result.get("data", {}).get("id")
+                    logging.info(f"Successfully posted to Twitter: {tweet_text[:30]}...")
+                else:
+                    logging.error("Failed to post to Twitter")
 
-        except Exception as e:
-            logging.error(f"Error posting to Twitter: {str(e)}")
-            import traceback
-            logging.error(f"Traceback: {traceback.format_exc()}")
-            return False
-
-    def post_to_platforms(self, image_paths, doc_url, doc_info=None):
-        """Post to all available platforms independently"""
-        bluesky_success = False
-        twitter_success = False
-
-        # Post to Bluesky
-        if self.bluesky_authenticated:
-            bluesky_success = self.post_to_bluesky(image_paths, doc_url, doc_info)
-
-        # Post to Twitter
-        if self.twitter_authenticated:
-            twitter_success = self.post_to_twitter(image_paths, doc_url, doc_info)
-
-        # Log results
-        platforms_posted = []
-        if bluesky_success:
-            platforms_posted.append("Bluesky")
-        if twitter_success:
-            platforms_posted.append("Twitter")
-
-        if platforms_posted:
-            logging.info(f"Successfully posted to: {', '.join(platforms_posted)}")
+        if tweet_id:
+            logging.info(f"Successfully posted document to Twitter: {doc_title}")
         else:
-            logging.warning("Failed to post to any platform")
-
-        return bluesky_success or twitter_success
+            logging.warning(f"No tweets were posted for document: {doc_title}")
 
 
 def main():
     logging.info("Starting FIA Document Handler")
     handler = FIADocumentHandler()
-
-    # Authenticate with Bluesky
     try:
-        bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_USERNAME")
-        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
-        if bluesky_username and bluesky_password:
-            handler.authenticate_bluesky(
-                bluesky_username,
-                bluesky_password,
-                max_retries=3,
-                timeout=30,
-            )
-        else:
-            logging.warning("Bluesky credentials not found in environment variables")
-    except Exception as e:
-        logging.error(f"Bluesky authentication failed: {str(e)}")
+        # Authenticate with Bluesky
+        handler.authenticate_bluesky(
+            os.environ["BLUESKY_USERNAME"],
+            os.environ["BLUESKY_PASSWORD"],
+            max_retries=3,
+            timeout=30,
+        )
 
-    # Authenticate with Twitter
-    try:
-        twitter_consumer_key = os.environ.get("TWITTER_API_KEY")
-        twitter_consumer_secret = os.environ.get("TWITTER_API_SECRET")
-        twitter_access_token = os.environ.get("TWITTER_ACCESS_TOKEN")
-        twitter_access_token_secret = os.environ.get("TWITTER_ACCESS_TOKEN_SECRET")
+        # Authenticate with Twitter/X
+        handler.authenticate_twitter(
+            os.environ.get("TWITTER_API_KEY", ""),
+            os.environ.get("TWITTER_API_SECRET", ""),
+            os.environ.get("TWITTER_ACCESS_TOKEN", ""),
+            os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", ""),
+        )
 
-        if all([twitter_consumer_key, twitter_consumer_secret, twitter_access_token, twitter_access_token_secret]):
-            handler.authenticate_twitter(
-                twitter_consumer_key,
-                twitter_consumer_secret,
-                twitter_access_token,
-                twitter_access_token_secret
-            )
-        else:
-            logging.warning("Twitter credentials not found in environment variables")
-    except Exception as e:
-        logging.error(f"Twitter authentication failed: {str(e)}")
-
-    # Check if at least one platform is authenticated
-    if not handler.bluesky_authenticated and not handler.twitter_authenticated:
-        logging.error("No platforms authenticated. Exiting.")
-        return
-
-    try:
         documents, document_info = handler.fetch_documents()
         unique_documents = list(dict.fromkeys(documents))
         logging.info(f"Found {len(unique_documents)} new documents to process")
@@ -470,18 +594,15 @@ def main():
 
                 image_paths = handler.download_and_convert_pdf(doc_url)
 
-                # Post to all available platforms
-                success = handler.post_to_platforms(image_paths, doc_url, document_info)
+                # Post to Bluesky
+                handler.post_to_bluesky(image_paths, doc_url, document_info)
 
-                # Only mark as processed if at least one platform succeeded
-                if success:
-                    handler.processed_docs["urls"].append(doc_url)
-                    handler._save_processed_docs()
-                    logging.info(f"Document {doc_url} processed and saved to processed_docs.json")
-                else:
-                    logging.error(f"Failed to post document {doc_url} to any platform")
+                # Post to Twitter/X
+                handler.post_to_twitter(image_paths, doc_url, document_info)
 
-                # Clean up image files
+                handler.processed_docs["urls"].append(doc_url)
+                handler._save_processed_docs()
+
                 for img_path in image_paths:
                     if os.path.exists(img_path):
                         os.remove(img_path)
@@ -499,5 +620,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
