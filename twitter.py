@@ -1,19 +1,14 @@
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
-import secrets
-import string
 import time
-import urllib.parse
 from datetime import datetime
 
 import pdf2image
 import requests
 from atproto import Client
 from bs4 import BeautifulSoup
+from requests_oauthlib import OAuth1
 
 # Global hashtags - Change in 2 places
 GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SpanishGP"
@@ -29,79 +24,22 @@ class TwitterAPIClient:
         self.api_secret = api_secret
         self.access_token = access_token
         self.access_token_secret = access_token_secret
-        self.base_url = "https://api.twitter.com"
-
-    def _generate_oauth_signature(self, method, url, params, oauth_params):
-        """Generate OAuth 1.0a signature"""
-        # Combine all parameters
-        all_params = {**params, **oauth_params}
-
-        # Sort parameters
-        sorted_params = sorted(all_params.items())
-
-        # Create parameter string
-        param_string = "&".join([f"{k}={v}" for k, v in sorted_params])
-
-        # Create signature base string
-        signature_base = f"{method}&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(param_string, safe='')}"
-
-        # Create signing key
-        signing_key = f"{urllib.parse.quote(self.api_secret, safe='')}&{urllib.parse.quote(self.access_token_secret, safe='')}"
-
-        # Generate signature
-        signature = base64.b64encode(
-            hmac.new(
-                signing_key.encode(), signature_base.encode(), hashlib.sha1
-            ).digest()
-        ).decode()
-
-        return signature
-
-    def _get_oauth_header(self, method, url, params=None):
-        """Generate OAuth 1.0a authorization header"""
-        if params is None:
-            params = {}
-
-        # Generate OAuth parameters
-        oauth_params = {
-            "oauth_consumer_key": self.api_key,
-            "oauth_token": self.access_token,
-            "oauth_signature_method": "HMAC-SHA1",
-            "oauth_timestamp": str(int(time.time())),
-            "oauth_nonce": "".join(
-                secrets.choice(string.ascii_letters + string.digits) for _ in range(32)
-            ),
-            "oauth_version": "1.0",
-        }
-
-        # Generate signature
-        signature = self._generate_oauth_signature(method, url, params, oauth_params)
-        oauth_params["oauth_signature"] = signature
-
-        # Create authorization header
-        auth_header = "OAuth " + ", ".join(
-            [
-                f'{k}="{urllib.parse.quote(str(v), safe="")}"'
-                for k, v in sorted(oauth_params.items())
-            ]
+        self.oauth = OAuth1(
+            api_key,
+            client_secret=api_secret,
+            resource_owner_key=access_token,
+            resource_owner_secret=access_token_secret,
         )
 
-        return auth_header
-
     def upload_media(self, image_data, media_type="image/jpeg"):
-        """Upload media to Twitter using v1.1 API with OAuth 1.0a"""
+        """Upload media to X using v2 API with OAuth 1.0a"""
         try:
-            # Use v1.1 media upload endpoint
-            url = "https://upload.twitter.com/1.1/media/upload.json"
-
-            # Get OAuth header
-            auth_header = self._get_oauth_header("POST", url)
-
-            headers = {"Authorization": auth_header}
+            # Use the new X API v2 media upload endpoint
+            url = "https://api.x.com/2/media/upload"
 
             files = {"media": ("image.jpg", image_data, media_type)}
 
-            response = requests.post(url, files=files, headers=headers)
+            response = requests.post(url, files=files, auth=self.oauth)
 
             if response.status_code == 200:
                 return response.json()["media_id_string"]
@@ -116,9 +54,9 @@ class TwitterAPIClient:
             return None
 
     def post_tweet(self, text, media_ids=None, reply_to_tweet_id=None):
-        """Post a tweet using v2 API with OAuth 1.0a"""
+        """Post a tweet using X API v2 with OAuth 1.0a"""
         try:
-            url = f"{self.base_url}/2/tweets"
+            url = "https://api.x.com/2/posts"
 
             tweet_data = {"text": text}
 
@@ -128,15 +66,13 @@ class TwitterAPIClient:
             if reply_to_tweet_id:
                 tweet_data["reply"] = {"in_reply_to_tweet_id": reply_to_tweet_id}
 
-            # Get OAuth header
-            auth_header = self._get_oauth_header("POST", url)
-
             headers = {
-                "Authorization": auth_header,
                 "Content-Type": "application/json",
             }
 
-            response = requests.post(url, json=tweet_data, headers=headers)
+            response = requests.post(
+                url, json=tweet_data, headers=headers, auth=self.oauth
+            )
 
             if response.status_code == 201:
                 return response.json()["data"]
