@@ -1,52 +1,52 @@
-name: FIA Document Checker
-on:
-  schedule:
-    - cron: '*/10 * * * *'
-  workflow_dispatch:
+# name: FIA Document Checker
+# on:
+#   schedule:
+#     - cron: '*/10 * * * *'
+#   workflow_dispatch:
 
-jobs:
-  check-documents:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+# jobs:
+#   check-documents:
+#     runs-on: ubuntu-latest
+#     permissions:
+#       contents: write
 
-    steps:
-      - uses: actions/checkout@v3
+#     steps:
+#       - uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
+#       - name: Set up Python
+#         uses: actions/setup-python@v4
+#         with:
+#           python-version: '3.x'
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y poppler-utils
+#       - name: Install system dependencies
+#         run: |
+#           sudo apt-get update
+#           sudo apt-get install -y poppler-utils
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+#       - name: Install Python dependencies
+#         run: |
+#           python -m pip install --upgrade pip
+#           pip install -r requirements.txt
 
-      - name: Run FIA document checker
-        env:
-          BLUESKY_USERNAME: ${{ secrets.BLUESKY_USERNAME }}
-          BLUESKY_PASSWORD: ${{ secrets.BLUESKY_PASSWORD }}
-          TWITTER_API_KEY: ${{ secrets.TWITTER_API_KEY }}
-          TWITTER_API_SECRET: ${{ secrets.TWITTER_API_SECRET }}
-          TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
-          TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
-          TWITTER_BEARER_TOKEN: ${{ secrets.TWITTER_BEARER_TOKEN }}
-          TWITTER_CLIENT_ID: ${{ secrets.TWITTER_CLIENT_ID }}
-          TWITTER_CLIENT_SECRET: ${{ secrets.TWITTER_CLIENT_SECRET }}
-        run: python fia.py
+#       - name: Run FIA document checker
+#         env:
+#           BLUESKY_USERNAME: ${{ secrets.BLUESKY_USERNAME }}
+#           BLUESKY_PASSWORD: ${{ secrets.BLUESKY_PASSWORD }}
+#           TWITTER_API_KEY: ${{ secrets.TWITTER_API_KEY }}
+#           TWITTER_API_SECRET: ${{ secrets.TWITTER_API_SECRET }}
+#           TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
+#           TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
+#           TWITTER_BEARER_TOKEN: ${{ secrets.TWITTER_BEARER_TOKEN }}
+#           TWITTER_CLIENT_ID: ${{ secrets.TWITTER_CLIENT_ID }}
+#           TWITTER_CLIENT_SECRET: ${{ secrets.TWITTER_CLIENT_SECRET }}
+#         run: python fia.py
 
-      - name: Configure Git
-        run: |
-          git config --global user.name 'GitHub Action'
-          git config --global user.email 'action@github.com'
+#       - name: Configure Git
+#         run: |
+#           git config --global user.name 'GitHub Action'
+#           git config --global user.email 'action@github.com'
 
-      - name: Commit and push if changed
-        run: |
-          git add processed_docs.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update processed documents list" && git push)
+#       - name: Commit and push if changed
+#         run: |
+#           git add processed_docs.json
+#           git diff --quiet && git diff --staged --quiet || (git commit -m "Update processed documents list" && git push)
