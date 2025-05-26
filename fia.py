@@ -71,7 +71,7 @@ class FIADocumentHandler:
         self, consumer_key, consumer_secret, access_token, access_token_secret
     ):
         try:
-            # Create the custom Twitter client without user_auth parameter
+            # Create the custom Twitter client
             self.twitter_client = PostponeTweepyClientV2(
                 consumer_key=consumer_key,
                 consumer_secret=consumer_secret,
@@ -79,11 +79,22 @@ class FIADocumentHandler:
                 access_token_secret=access_token_secret,
                 wait_on_rate_limit=True,
             )
-            # Test the connection
-            me = self.twitter_client.get_me()
-            logging.info(
-                f"Successfully authenticated with Twitter as @{me.data.username}"
+
+            # Instead of using get_me(), let's use a direct request to verify credentials
+            response = self.twitter_client.request(
+                "GET",
+                "/2/users/me",
+                params={"user.fields": "username"},
             )
+            user_data = response.json()
+            if "data" in user_data and "username" in user_data["data"]:
+                logging.info(
+                    f"Successfully authenticated with Twitter as @{user_data['data']['username']}"
+                )
+            else:
+                logging.warning(
+                    "Twitter authentication successful but couldn't get username"
+                )
         except Exception as e:
             logging.error(f"Failed to authenticate with Twitter: {str(e)}")
             raise
@@ -258,8 +269,9 @@ class FIADocumentHandler:
                 for img_path in chunk:
                     try:
                         with open(img_path, "rb") as img_file:
+                            # Use the media_upload method from our custom client
                             media_response = self.twitter_client.media_upload(
-                                filename=img_path, file=img_file
+                                filename=os.path.basename(img_path), file=img_file
                             )
                             media_ids.append(media_response["id"])
 
