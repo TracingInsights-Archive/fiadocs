@@ -1,7 +1,11 @@
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import time
+import urllib.parse
 from datetime import datetime
 
 import pdf2image
@@ -24,22 +28,18 @@ class TwitterAPIClient:
         self.api_secret = api_secret
         self.access_token = access_token
         self.access_token_secret = access_token_secret
-        self.oauth = OAuth1(
-            api_key,
-            client_secret=api_secret,
-            resource_owner_key=access_token,
-            resource_owner_secret=access_token_secret,
-        )
+        self.auth = OAuth1(api_key, api_secret, access_token, access_token_secret)
+        self.base_url = "https://api.twitter.com"
 
     def upload_media(self, image_data, media_type="image/jpeg"):
-        """Upload media to X using v2 API with OAuth 1.0a"""
+        """Upload media to Twitter using v1.1 API (v2 doesn't support media upload yet)"""
         try:
-            # Use the new X API v2 media upload endpoint
-            url = "https://api.x.com/2/media/upload"
+            # Use v1.1 API for media upload as v2 doesn't support it yet
+            url = f"{self.base_url}/1.1/media/upload.json"
 
             files = {"media": ("image.jpg", image_data, media_type)}
 
-            response = requests.post(url, files=files, auth=self.oauth)
+            response = requests.post(url, files=files, auth=self.auth)
 
             if response.status_code == 200:
                 return response.json()["media_id_string"]
@@ -54,9 +54,9 @@ class TwitterAPIClient:
             return None
 
     def post_tweet(self, text, media_ids=None, reply_to_tweet_id=None):
-        """Post a tweet using X API v2 with OAuth 1.0a"""
+        """Post a tweet using v2 API"""
         try:
-            url = "https://api.x.com/2/posts"
+            url = f"{self.base_url}/2/tweets"
 
             tweet_data = {"text": text}
 
@@ -71,7 +71,7 @@ class TwitterAPIClient:
             }
 
             response = requests.post(
-                url, json=tweet_data, headers=headers, auth=self.oauth
+                url, json=tweet_data, headers=headers, auth=self.auth
             )
 
             if response.status_code == 201:
@@ -92,8 +92,10 @@ class FIADocumentHandler:
         self.base_url = "https://www.fia.com/documents/championships/fia-formula-one-world-championship-14/season/season-2025-2071"
         self.download_dir = "downloads"
         self.processed_docs = self._load_processed_docs()
-        self.bluesky_client = Client()
+        self.bluesky_client = None
         self.twitter_client = None
+        self.bluesky_authenticated = False
+        self.twitter_authenticated = False
 
     def _load_processed_docs(self):
         try:
@@ -120,32 +122,58 @@ class FIADocumentHandler:
             json.dump(self.processed_docs["urls"], f)
 
     def authenticate_bluesky(self, username, password, max_retries=3, timeout=30):
-        for attempt in range(max_retries):
-            try:
-                self.bluesky_client = Client()
-                self.bluesky_client.login(username, password)
-                logging.info("Successfully authenticated with Bluesky")
-                return
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                logging.warning(
-                    f"Authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
-                )
-                time.sleep(2**attempt)
+        """Authenticate with Bluesky - independent of Twitter authentication"""
+        try:
+            for attempt in range(max_retries):
+                try:
+                    self.bluesky_client = Client()
+                    self.bluesky_client.login(username, password)
+                    self.bluesky_authenticated = True
+                    logging.info("Successfully authenticated with Bluesky")
+                    return True
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logging.warning(
+                        f"Bluesky authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                    )
+                    time.sleep(2**attempt)
+        except Exception as e:
+            logging.error(f"Failed to authenticate with Bluesky: {str(e)}")
+            self.bluesky_authenticated = False
+            self.bluesky_client = None
+            return False
 
     def authenticate_twitter(
         self, api_key, api_secret, access_token, access_token_secret
     ):
-        """Initialize Twitter API client with OAuth 1.0a credentials"""
+        """Authenticate with Twitter - independent of Bluesky authentication"""
         try:
             self.twitter_client = TwitterAPIClient(
                 api_key, api_secret, access_token, access_token_secret
             )
-            logging.info("Successfully initialized Twitter API client")
+
+            # Test the connection by getting user info
+            test_url = f"{self.twitter_client.base_url}/2/users/me"
+            response = requests.get(test_url, auth=self.twitter_client.auth)
+
+            if response.status_code == 200:
+                self.twitter_authenticated = True
+                logging.info("Successfully initialized and tested Twitter API client")
+                return True
+            else:
+                logging.error(
+                    f"Twitter API test failed: {response.status_code} - {response.text}"
+                )
+                self.twitter_authenticated = False
+                self.twitter_client = None
+                return False
+
         except Exception as e:
             logging.error(f"Failed to initialize Twitter client: {str(e)}")
+            self.twitter_authenticated = False
             self.twitter_client = None
+            return False
 
     def _make_filename_readable(self, filename):
         # Remove file extension
@@ -286,94 +314,112 @@ class FIADocumentHandler:
         return future_races[next_race_date]
 
     def post_to_bluesky(self, image_paths, doc_url, doc_info=None):
-        doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
-        gp_hashtag = self._get_current_gp_hashtag()
+        """Post to Bluesky - independent operation"""
+        if not self.bluesky_authenticated or not self.bluesky_client:
+            logging.warning("Bluesky not authenticated, skipping Bluesky post")
+            return False
 
-        max_title_length = 200
-        if len(doc_title) > max_title_length:
-            doc_title = doc_title[: max_title_length - 3] + "..."
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+            gp_hashtag = self._get_current_gp_hashtag()
 
-        all_hashtags = f"{GLOBAL_HASHTAGS}"
-        formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+            max_title_length = 200
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
 
-        if len(formatted_text) + len(doc_url) + 1 <= 300:
-            formatted_text += f"\n\n{doc_url}"
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+            formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
 
-        encoded_doc_url = requests.utils.quote(doc_url, safe=":/?=")
-        facets = []
+            if len(formatted_text) + len(doc_url) + 1 <= 300:
+                formatted_text += f"\n\n{doc_url}"
 
-        # Add URL facet
-        url_start = formatted_text.find(doc_url)
-        if url_start != -1:
-            byte_start = len(formatted_text[:url_start].encode("utf-8"))
-            byte_end = len(formatted_text[: url_start + len(doc_url)].encode("utf-8"))
-            facets.append(
-                {
-                    "index": {"byteStart": byte_start, "byteEnd": byte_end},
-                    "features": [
-                        {
-                            "$type": "app.bsky.richtext.facet#link",
-                            "uri": encoded_doc_url,
-                        }
-                    ],
-                }
-            )
+            encoded_doc_url = requests.utils.quote(doc_url, safe=":/?=")
+            facets = []
 
-        # Make all hashtags clickable
-        all_tags = ["f1", "formula1", "fia", "SpanishGP"]
-        for tag in all_tags:
-            tag_with_hash = f"#{tag}"
-            tag_pos = formatted_text.find(tag_with_hash)
-            if tag_pos != -1:
-                byte_start = len(formatted_text[:tag_pos].encode("utf-8"))
+            # Add URL facet
+            url_start = formatted_text.find(doc_url)
+            if url_start != -1:
+                byte_start = len(formatted_text[:url_start].encode("utf-8"))
                 byte_end = len(
-                    formatted_text[: tag_pos + len(tag_with_hash)].encode("utf-8")
+                    formatted_text[: url_start + len(doc_url)].encode("utf-8")
                 )
                 facets.append(
                     {
                         "index": {"byteStart": byte_start, "byteEnd": byte_end},
                         "features": [
-                            {"$type": "app.bsky.richtext.facet#tag", "tag": tag}
+                            {
+                                "$type": "app.bsky.richtext.facet#link",
+                                "uri": encoded_doc_url,
+                            }
                         ],
                     }
                 )
 
-        root_post = None
-        parent_post = None
+            # Make all hashtags clickable
+            all_tags = ["f1", "formula1", "fia", "SpanishGP"]
+            for tag in all_tags:
+                tag_with_hash = f"#{tag}"
+                tag_pos = formatted_text.find(tag_with_hash)
+                if tag_pos != -1:
+                    byte_start = len(formatted_text[:tag_pos].encode("utf-8"))
+                    byte_end = len(
+                        formatted_text[: tag_pos + len(tag_with_hash)].encode("utf-8")
+                    )
+                    facets.append(
+                        {
+                            "index": {"byteStart": byte_start, "byteEnd": byte_end},
+                            "features": [
+                                {"$type": "app.bsky.richtext.facet#tag", "tag": tag}
+                            ],
+                        }
+                    )
 
-        for i in range(0, len(image_paths), 4):
-            chunk = image_paths[i : i + 4]
-            images = {"$type": "app.bsky.embed.images", "images": []}
+            root_post = None
+            parent_post = None
 
-            for img_path in chunk:
-                with open(img_path, "rb") as f:
-                    image_data = f.read()
-                response = self.bluesky_client.upload_blob(image_data)
-                images["images"].append({"image": response.blob, "alt": doc_title})
+            for i in range(0, len(image_paths), 4):
+                chunk = image_paths[i : i + 4]
+                images = {"$type": "app.bsky.embed.images", "images": []}
 
-            if parent_post:
-                reply = {
-                    "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
-                    "parent": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
-                }
-                post_result = self.bluesky_client.post(
-                    text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
-                    embed=images,
-                    reply_to=reply,
-                )
-                parent_post = {"uri": post_result.uri, "cid": post_result.cid}
-            else:
-                post_result = self.bluesky_client.post(
-                    text=formatted_text, facets=facets, embed=images
-                )
-                root_post = {"uri": post_result.uri, "cid": post_result.cid}
-                parent_post = root_post
+                for img_path in chunk:
+                    with open(img_path, "rb") as f:
+                        image_data = f.read()
+                    response = self.bluesky_client.upload_blob(image_data)
+                    images["images"].append({"image": response.blob, "alt": doc_title})
+
+                if parent_post:
+                    reply = {
+                        "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
+                        "parent": {
+                            "uri": parent_post["uri"],
+                            "cid": parent_post["cid"],
+                        },
+                    }
+                    post_result = self.bluesky_client.post(
+                        text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
+                        embed=images,
+                        reply_to=reply,
+                    )
+                    parent_post = {"uri": post_result.uri, "cid": post_result.cid}
+                else:
+                    post_result = self.bluesky_client.post(
+                        text=formatted_text, facets=facets, embed=images
+                    )
+                    root_post = {"uri": post_result.uri, "cid": post_result.cid}
+                    parent_post = root_post
+
+            logging.info(f"Successfully posted to Bluesky: {doc_title}")
+            return True
+
+        except Exception as e:
+            logging.error(f"Error posting to Bluesky: {str(e)}")
+            return False
 
     def post_to_twitter(self, image_paths, doc_url, doc_info=None):
-        """Post document to Twitter as a thread"""
-        if not self.twitter_client:
-            logging.warning("Twitter client not initialized, skipping Twitter post")
-            return
+        """Post document to Twitter as a thread - independent operation"""
+        if not self.twitter_authenticated or not self.twitter_client:
+            logging.warning("Twitter not authenticated, skipping Twitter post")
+            return False
 
         try:
             doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
@@ -450,72 +496,133 @@ class FIADocumentHandler:
                 logging.info(
                     f"Successfully posted Twitter thread for document: {doc_title}"
                 )
+                return True
             else:
                 logging.error("Failed to post Twitter thread")
+                return False
 
         except Exception as e:
             logging.error(f"Error posting to Twitter: {str(e)}")
+            return False
 
     def post_to_both_platforms(self, image_paths, doc_url, doc_info=None):
-        """Post to both Bluesky and Twitter"""
-        try:
-            # Post to Bluesky (existing functionality)
-            logging.info("Posting to Bluesky...")
-            self.post_to_bluesky(image_paths, doc_url, doc_info)
-            logging.info("Successfully posted to Bluesky")
+        """Post to both platforms independently - one failure won't affect the other"""
+        bluesky_success = False
+        twitter_success = False
 
-            # Add small delay between platforms
-            time.sleep(3)
+        # Post to Bluesky (independent operation)
+        if self.bluesky_authenticated:
+            try:
+                logging.info("Posting to Bluesky...")
+                bluesky_success = self.post_to_bluesky(image_paths, doc_url, doc_info)
+                if bluesky_success:
+                    logging.info("Successfully posted to Bluesky")
+                else:
+                    logging.error("Failed to post to Bluesky")
+            except Exception as e:
+                logging.error(f"Error posting to Bluesky: {str(e)}")
+        else:
+            logging.info("Bluesky not authenticated, skipping Bluesky post")
 
-            # Post to Twitter (new functionality)
-            logging.info("Posting to Twitter...")
-            self.post_to_twitter(image_paths, doc_url, doc_info)
-            logging.info("Successfully posted to Twitter")
+        # Add small delay between platforms
+        time.sleep(3)
 
-        except Exception as e:
-            logging.error(f"Error posting to platforms: {str(e)}")
-            raise
+        # Post to Twitter (independent operation)
+        if self.twitter_authenticated:
+            try:
+                logging.info("Posting to Twitter...")
+                twitter_success = self.post_to_twitter(image_paths, doc_url, doc_info)
+                if twitter_success:
+                    logging.info("Successfully posted to Twitter")
+                else:
+                    logging.error("Failed to post to Twitter")
+            except Exception as e:
+                logging.error(f"Error posting to Twitter: {str(e)}")
+        else:
+            logging.info("Twitter not authenticated, skipping Twitter post")
+
+        # Log overall results
+        if bluesky_success and twitter_success:
+            logging.info("Successfully posted to both platforms")
+        elif bluesky_success:
+            logging.info("Posted to Bluesky only (Twitter failed or not configured)")
+        elif twitter_success:
+            logging.info("Posted to Twitter only (Bluesky failed or not configured)")
+        else:
+            logging.warning("Failed to post to any platform")
+
+        # Return True if at least one platform succeeded
+        return bluesky_success or twitter_success
 
 
 def main():
     logging.info("Starting FIA Document Handler")
     handler = FIADocumentHandler()
 
-    try:
-        # Authenticate with Bluesky
-        handler.authenticate_bluesky(
-            os.environ["BLUESKY_USERNAME"],
-            os.environ["BLUESKY_PASSWORD"],
-            max_retries=3,
-            timeout=30,
+    # Track which platforms are available
+    platforms_available = []
+
+    # Try to authenticate with Bluesky (independent)
+    bluesky_username = os.environ.get("BLUESKY_USERNAME")
+    bluesky_password = os.environ.get("BLUESKY_USERNAME")
+    # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+
+    if bluesky_username and bluesky_password:
+        try:
+            if handler.authenticate_bluesky(
+                bluesky_username, bluesky_password, max_retries=3, timeout=30
+            ):
+                platforms_available.append("Bluesky")
+            else:
+                logging.warning(
+                    "Bluesky authentication failed, will skip Bluesky posts"
+                )
+        except Exception as e:
+            logging.error(f"Bluesky authentication error: {str(e)}")
+    else:
+        logging.warning("Bluesky credentials not provided, will skip Bluesky posts")
+
+    # Try to authenticate with Twitter (independent)
+    twitter_api_key = os.environ.get("TWITTER_API_KEY")
+    twitter_api_secret = os.environ.get("TWITTER_API_SECRET")
+    twitter_access_token = os.environ.get("TWITTER_ACCESS_TOKEN")
+    twitter_access_token_secret = os.environ.get("TWITTER_ACCESS_TOKEN_SECRET")
+
+    if all(
+        [
+            twitter_api_key,
+            twitter_api_secret,
+            twitter_access_token,
+            twitter_access_token_secret,
+        ]
+    ):
+        try:
+            if handler.authenticate_twitter(
+                twitter_api_key,
+                twitter_api_secret,
+                twitter_access_token,
+                twitter_access_token_secret,
+            ):
+                platforms_available.append("Twitter")
+            else:
+                logging.warning(
+                    "Twitter authentication failed, will skip Twitter posts"
+                )
+        except Exception as e:
+            logging.error(f"Twitter authentication error: {str(e)}")
+    else:
+        logging.warning(
+            "Twitter OAuth credentials not provided, will skip Twitter posts"
         )
 
-        # Authenticate with Twitter using OAuth 1.0a credentials
-        twitter_api_key = os.environ.get("TWITTER_API_KEY")
-        twitter_api_secret = os.environ.get("TWITTER_API_SECRET")
-        twitter_access_token = os.environ.get("TWITTER_ACCESS_TOKEN")
-        twitter_access_token_secret = os.environ.get("TWITTER_ACCESS_TOKEN_SECRET")
+    # Check if at least one platform is available
+    if not platforms_available:
+        logging.error("No platforms available for posting. Exiting.")
+        return
 
-        if all(
-            [
-                twitter_api_key,
-                twitter_api_secret,
-                twitter_access_token,
-                twitter_access_token_secret,
-            ]
-        ):
-            handler.authenticate_twitter(
-                twitter_api_key,
-                twitter_api_secret,
-                twitter_access_token,
-                twitter_access_token_secret,
-            )
-            logging.info("Twitter authentication successful")
-        else:
-            logging.warning(
-                "Twitter OAuth credentials not provided, will only post to Bluesky"
-            )
+    logging.info(f"Available platforms: {', '.join(platforms_available)}")
 
+    try:
         # Fetch and process documents
         documents, document_info = handler.fetch_documents()
         unique_documents = list(dict.fromkeys(documents))
@@ -531,14 +638,25 @@ def main():
                     continue
 
                 # Download and convert PDF to images
+                logging.info(f"Processing document: {doc_url}")
                 image_paths = handler.download_and_convert_pdf(doc_url)
 
-                # Post to both platforms
-                handler.post_to_both_platforms(image_paths, doc_url, document_info)
+                # Post to available platforms (independent operations)
+                success = handler.post_to_both_platforms(
+                    image_paths, doc_url, document_info
+                )
 
-                # Mark as processed
-                handler.processed_docs["urls"].append(doc_url)
-                handler._save_processed_docs()
+                if success:
+                    # Mark as processed only if at least one platform succeeded
+                    handler.processed_docs["urls"].append(doc_url)
+                    handler._save_processed_docs()
+                    logging.info(
+                        f"Document processed and marked as complete: {doc_url}"
+                    )
+                else:
+                    logging.error(
+                        f"Failed to post to any platform for document: {doc_url}"
+                    )
 
                 # Clean up image files
                 for img_path in image_paths:
@@ -553,10 +671,10 @@ def main():
                 continue
 
     except Exception as e:
-        logging.error(f"Fatal error: {str(e)}")
+        logging.error(f"Fatal error in main process: {str(e)}")
         raise
 
-    logging.info("FIA Document Handler completed successfully")
+    logging.info("FIA Document Handler completed")
 
 
 if __name__ == "__main__":
