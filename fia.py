@@ -350,7 +350,7 @@ class FIADocumentHandler:
                         chunk_media_ids.append(media_id)
                         logging.info(f"Successfully uploaded image, media_id: {media_id}")
                     else:
-                        logging.warning(f"Failed to upload image {img_path} to Twitter")
+                        logging.error(f"Failed to upload image {img_path} to Twitter")
 
                 if chunk_media_ids:
                     if i == 0:
@@ -380,7 +380,6 @@ class FIADocumentHandler:
             import traceback
             logging.error(f"Traceback: {traceback.format_exc()}")
             return False
-
 
     def post_to_platforms(self, image_paths, doc_url, doc_info=None):
         """Post to all available platforms independently"""
@@ -419,7 +418,6 @@ def main():
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
         bluesky_password = os.environ.get("BLUESKY_USERNAME")
         # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
-
         if bluesky_username and bluesky_password:
             handler.authenticate_bluesky(
                 bluesky_username,
@@ -501,3 +499,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
