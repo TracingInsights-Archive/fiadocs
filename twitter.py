@@ -4,6 +4,8 @@ import hmac
 import json
 import logging
 import os
+import secrets
+import string
 import time
 import urllib.parse
 from datetime import datetime
@@ -22,18 +24,82 @@ logging.basicConfig(
 
 
 class TwitterAPIClient:
-    def __init__(self, bearer_token):
-        self.bearer_token = bearer_token
+    def __init__(self, api_key, api_secret, access_token, access_token_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.access_token = access_token
+        self.access_token_secret = access_token_secret
         self.base_url = "https://api.twitter.com"
 
+    def _generate_oauth_signature(self, method, url, params, oauth_params):
+        """Generate OAuth 1.0a signature"""
+        # Combine all parameters
+        all_params = {**params, **oauth_params}
+
+        # Sort parameters
+        sorted_params = sorted(all_params.items())
+
+        # Create parameter string
+        param_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+
+        # Create signature base string
+        signature_base = f"{method}&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(param_string, safe='')}"
+
+        # Create signing key
+        signing_key = f"{urllib.parse.quote(self.api_secret, safe='')}&{urllib.parse.quote(self.access_token_secret, safe='')}"
+
+        # Generate signature
+        signature = base64.b64encode(
+            hmac.new(
+                signing_key.encode(), signature_base.encode(), hashlib.sha1
+            ).digest()
+        ).decode()
+
+        return signature
+
+    def _get_oauth_header(self, method, url, params=None):
+        """Generate OAuth 1.0a authorization header"""
+        if params is None:
+            params = {}
+
+        # Generate OAuth parameters
+        oauth_params = {
+            "oauth_consumer_key": self.api_key,
+            "oauth_token": self.access_token,
+            "oauth_signature_method": "HMAC-SHA1",
+            "oauth_timestamp": str(int(time.time())),
+            "oauth_nonce": "".join(
+                secrets.choice(string.ascii_letters + string.digits) for _ in range(32)
+            ),
+            "oauth_version": "1.0",
+        }
+
+        # Generate signature
+        signature = self._generate_oauth_signature(method, url, params, oauth_params)
+        oauth_params["oauth_signature"] = signature
+
+        # Create authorization header
+        auth_header = "OAuth " + ", ".join(
+            [
+                f'{k}="{urllib.parse.quote(str(v), safe="")}"'
+                for k, v in sorted(oauth_params.items())
+            ]
+        )
+
+        return auth_header
+
     def upload_media(self, image_data, media_type="image/jpeg"):
-        """Upload media to Twitter using v2 API"""
+        """Upload media to Twitter using v1.1 API with OAuth 1.0a"""
         try:
-            url = f"{self.base_url}/2/media/upload"
+            # Use v1.1 media upload endpoint
+            url = "https://upload.twitter.com/1.1/media/upload.json"
+
+            # Get OAuth header
+            auth_header = self._get_oauth_header("POST", url)
+
+            headers = {"Authorization": auth_header}
 
             files = {"media": ("image.jpg", image_data, media_type)}
-
-            headers = {"Authorization": f"Bearer {self.bearer_token}"}
 
             response = requests.post(url, files=files, headers=headers)
 
@@ -50,7 +116,7 @@ class TwitterAPIClient:
             return None
 
     def post_tweet(self, text, media_ids=None, reply_to_tweet_id=None):
-        """Post a tweet using v2 API"""
+        """Post a tweet using v2 API with OAuth 1.0a"""
         try:
             url = f"{self.base_url}/2/tweets"
 
@@ -62,8 +128,11 @@ class TwitterAPIClient:
             if reply_to_tweet_id:
                 tweet_data["reply"] = {"in_reply_to_tweet_id": reply_to_tweet_id}
 
+            # Get OAuth header
+            auth_header = self._get_oauth_header("POST", url)
+
             headers = {
-                "Authorization": f"Bearer {self.bearer_token}",
+                "Authorization": auth_header,
                 "Content-Type": "application/json",
             }
 
@@ -129,10 +198,14 @@ class FIADocumentHandler:
                 )
                 time.sleep(2**attempt)
 
-    def authenticate_twitter(self, bearer_token):
-        """Initialize Twitter API client with Bearer Token"""
+    def authenticate_twitter(
+        self, api_key, api_secret, access_token, access_token_secret
+    ):
+        """Initialize Twitter API client with OAuth 1.0a credentials"""
         try:
-            self.twitter_client = TwitterAPIClient(bearer_token)
+            self.twitter_client = TwitterAPIClient(
+                api_key, api_secret, access_token, access_token_secret
+            )
             logging.info("Successfully initialized Twitter API client")
         except Exception as e:
             logging.error(f"Failed to initialize Twitter client: {str(e)}")
@@ -476,21 +549,35 @@ def main():
         # Authenticate with Bluesky
         handler.authenticate_bluesky(
             os.environ["BLUESKY_USERNAME"],
-            # os.environ["BLUESKY_USERNAME"],
             os.environ["BLUESKY_PASSWORD"],
             max_retries=3,
             timeout=30,
         )
 
-        # Authenticate with Twitter using Bearer Token
-        twitter_bearer_token = os.environ.get("TWITTER_BEARER_TOKEN")
+        # Authenticate with Twitter using OAuth 1.0a credentials
+        twitter_api_key = os.environ.get("TWITTER_API_KEY")
+        twitter_api_secret = os.environ.get("TWITTER_API_SECRET")
+        twitter_access_token = os.environ.get("TWITTER_ACCESS_TOKEN")
+        twitter_access_token_secret = os.environ.get("TWITTER_ACCESS_TOKEN_SECRET")
 
-        if twitter_bearer_token:
-            handler.authenticate_twitter(twitter_bearer_token)
+        if all(
+            [
+                twitter_api_key,
+                twitter_api_secret,
+                twitter_access_token,
+                twitter_access_token_secret,
+            ]
+        ):
+            handler.authenticate_twitter(
+                twitter_api_key,
+                twitter_api_secret,
+                twitter_access_token,
+                twitter_access_token_secret,
+            )
             logging.info("Twitter authentication successful")
         else:
             logging.warning(
-                "Twitter Bearer Token not provided, will only post to Bluesky"
+                "Twitter OAuth credentials not provided, will only post to Bluesky"
             )
 
         # Fetch and process documents
