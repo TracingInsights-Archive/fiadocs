@@ -209,34 +209,34 @@ class TwitterAPI:
         return media_types.get(extension, "application/octet-stream")
 
 
-def main():
-    # Replace these with your actual credentials
-    consumer_key = "YOUR_CONSUMER_KEY"
-    consumer_secret = "YOUR_CONSUMER_SECRET"
-    access_token = "YOUR_ACCESS_TOKEN"
-    access_token_secret = "YOUR_ACCESS_TOKEN_SECRET"
+# def main():
+#     # Replace these with your actual credentials
+#     consumer_key = "YOUR_CONSUMER_KEY"
+#     consumer_secret = "YOUR_CONSUMER_SECRET"
+#     access_token = "YOUR_ACCESS_TOKEN"
+#     access_token_secret = "YOUR_ACCESS_TOKEN_SECRET"
 
-    # Initialize the Twitter API client
-    twitter = TwitterAPI(consumer_key, consumer_secret, access_token, access_token_secret)
+#     # Initialize the Twitter API client
+#     twitter = TwitterAPI(consumer_key, consumer_secret, access_token, access_token_secret)
 
-    # Example: Upload an image and post a tweet with it
-    image_path = "path/to/your/image.jpg"  # Replace with actual path
-    tweet_text = "Check out this image!"  # Replace with your tweet text
+#     # Example: Upload an image and post a tweet with it
+#     image_path = "path/to/your/image.jpg"  # Replace with actual path
+#     tweet_text = "Check out this image!"  # Replace with your tweet text
 
-    # Upload the image
-    media_id = twitter.upload_image_chunked(image_path)
+#     # Upload the image
+#     media_id = twitter.upload_image_chunked(image_path)
 
-    if media_id:
-        print(f"Image uploaded successfully with media_id: {media_id}")
+#     if media_id:
+#         print(f"Image uploaded successfully with media_id: {media_id}")
 
-        # Post a tweet with the uploaded image
-        tweet = twitter.post_tweet_with_media(tweet_text, media_id)
+#         # Post a tweet with the uploaded image
+#         tweet = twitter.post_tweet_with_media(tweet_text, media_id)
 
-        if tweet:
-            print(f"Tweet posted successfully: {tweet}")
-    else:
-        print("Failed to upload image.")
+#         if tweet:
+#             print(f"Tweet posted successfully: {tweet}")
+#     else:
+#         print("Failed to upload image.")
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
