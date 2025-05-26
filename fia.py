@@ -71,6 +71,7 @@ class FIADocumentHandler:
         self, consumer_key, consumer_secret, access_token, access_token_secret
     ):
         try:
+            # Create the custom Twitter client without user_auth parameter
             self.twitter_client = PostponeTweepyClientV2(
                 consumer_key=consumer_key,
                 consumer_secret=consumer_secret,
@@ -256,13 +257,16 @@ class FIADocumentHandler:
                 # Upload images
                 for img_path in chunk:
                     try:
-                        media_response = self.twitter_client.media_upload(img_path)
-                        media_ids.append(media_response["id"])
+                        with open(img_path, "rb") as img_file:
+                            media_response = self.twitter_client.media_upload(
+                                filename=img_path, file=img_file
+                            )
+                            media_ids.append(media_response["id"])
 
-                        # Add alt text for accessibility
-                        self.twitter_client.create_media_metadata(
-                            media_response["id"], doc_title[:1000]  # Alt text limit
-                        )
+                            # Add alt text for accessibility
+                            self.twitter_client.create_media_metadata(
+                                media_response["id"], doc_title[:1000]  # Alt text limit
+                            )
                     except Exception as e:
                         logging.error(f"Failed to upload image {img_path}: {str(e)}")
                         continue
@@ -340,6 +344,7 @@ class FIADocumentHandler:
             )
 
         # Make all hashtags clickable
+        # Make all hashtags clickable
         all_tags = ["f1", "formula1", "fia", "SpanishGP"]
         for tag in all_tags:
             tag_with_hash = f"#{tag}"
@@ -411,13 +416,18 @@ def main():
     handler = FIADocumentHandler()
 
     try:
-        # Authenticate with Bluesky
-        handler.authenticate_bluesky(
-            os.environ["BLUESKY_USERNAME"],
-            os.environ["BLUESKY_PASSWORD"],
-            max_retries=3,
-            timeout=30,
-        )
+        try:
+            # Authenticate with Bluesky
+            handler.authenticate_bluesky(
+                os.environ["BLUESKY_USERNAME"],
+                os.environ["BLUESKY_USERNAME"],
+                # os.environ["BLUESKY_PASSWORD"],
+                max_retries=3,
+                timeout=30,
+            )
+        except Exception as e:
+            logging.error(f"Bluesky authentication failed: {e}")
+            return
 
         # Authenticate with Twitter (optional - will skip if credentials not provided)
         try:
