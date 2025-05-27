@@ -474,7 +474,6 @@ class FIADocumentHandler:
 
         try:
             doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
-            gp_hashtag = self._get_current_gp_hashtag()
 
             max_title_length = 200
             if len(doc_title) > max_title_length:
@@ -487,120 +486,67 @@ class FIADocumentHandler:
             if len(formatted_text) + len(doc_url) + 1 <= 480:
                 formatted_text += f"\n\n{doc_url}"
 
-            # Upload images to Threads and create posts
+            # Process images in chunks (Threads allows up to 10 images per post)
             root_post_id = None
             parent_post_id = None
 
-            for i in range(
-                0, len(image_paths), 10
-            ):  # Threads allows up to 10 images per post
+            # Add rate limiting to avoid hitting API limits
+            import time
+
+            for i in range(0, len(image_paths), 10):
                 chunk = image_paths[i : i + 10]
-                media_ids = []
 
-                # Upload images for this chunk
-                for img_path in chunk:
-                    try:
-                        # Step 1: Upload image to Threads
-                        with open(img_path, "rb") as f:
-                            files = {"image": f}
-                            data = {
-                                "access_token": self.threads_access_token,
-                                "image_url": "",  # We're uploading directly
-                            }
+                try:
+                    # Add delay between chunks to respect rate limits
+                    if i > 0:
+                        time.sleep(2)
 
-                            upload_url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/media"
-                            upload_response = requests.post(
-                                upload_url,
-                                files=files,
-                                data={
-                                    "access_token": self.threads_access_token,
-                                    "media_type": "IMAGE",
-                                },
-                            )
+                    # Determine post text
+                    post_text = (
+                        formatted_text
+                        if i == 0
+                        else f"Continued... ({i//10 + 1}/{(len(image_paths) + 9)//10})"
+                    )
 
-                            if upload_response.status_code == 200:
-                                media_data = upload_response.json()
-                                media_ids.append(media_data.get("id"))
-                            else:
-                                logging.warning(
-                                    f"Failed to upload image {img_path} to Threads: {upload_response.text}"
-                                )
-                                continue
-
-                    except Exception as e:
-                        logging.warning(
-                            f"Failed to upload image {img_path} to Threads: {str(e)}"
+                    # Create container based on number of images
+                    if len(chunk) == 1:
+                        container_id = self._create_threads_image_container(
+                            chunk[0], post_text, parent_post_id
                         )
-                        continue
+                    else:
+                        container_id = self._create_threads_carousel_container(
+                            chunk, post_text, parent_post_id
+                        )
 
-                # Create post with uploaded images
-                if media_ids:
-                    try:
-                        post_data = {
-                            "access_token": self.threads_access_token,
-                            "media_type": "CAROUSEL" if len(media_ids) > 1 else "IMAGE",
-                        }
+                    if container_id:
+                        # Wait a moment before publishing
+                        time.sleep(1)
 
-                        if len(media_ids) == 1:
-                            post_data["image_url"] = media_ids[0]
-                        else:
-                            post_data["children"] = media_ids
-
-                        # Add text for the first post or continuation text for subsequent posts
-                        if parent_post_id:
-                            post_data["text"] = (
-                                f"Continued... ({i//10 + 1}/{(len(image_paths) + 9)//10})"
+                        # Publish the container
+                        post_id = self._publish_threads_container(container_id)
+                        if post_id:
+                            if not root_post_id:
+                                root_post_id = post_id
+                            parent_post_id = post_id
+                            logging.info(
+                                f"Successfully posted chunk {i//10 + 1} to Threads"
                             )
-                            post_data["reply_to_id"] = parent_post_id
-                        else:
-                            post_data["text"] = formatted_text
-
-                        # Create media container
-                        create_url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/media"
-                        create_response = requests.post(create_url, data=post_data)
-
-                        if create_response.status_code == 200:
-                            container_data = create_response.json()
-                            container_id = container_data.get("id")
-
-                            # Publish the post
-                            publish_data = {
-                                "access_token": self.threads_access_token,
-                                "creation_id": container_id,
-                            }
-
-                            publish_url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/media_publish"
-                            publish_response = requests.post(
-                                publish_url, data=publish_data
-                            )
-
-                            if publish_response.status_code == 200:
-                                publish_data = publish_response.json()
-                                post_id = publish_data.get("id")
-
-                                if not root_post_id:
-                                    root_post_id = post_id
-                                parent_post_id = post_id
-
-                                logging.info(
-                                    f"Successfully posted chunk {i//10 + 1} to Threads"
-                                )
-                            else:
-                                logging.error(
-                                    f"Failed to publish Threads post: {publish_response.text}"
-                                )
-                                return False
                         else:
                             logging.error(
-                                f"Failed to create Threads media container: {create_response.text}"
+                                f"Failed to publish Threads container {container_id}"
                             )
                             return False
-
-                    except Exception as e:
+                    else:
                         logging.error(
-                            f"Failed to create Threads post for chunk {i//10 + 1}: {str(e)}"
+                            f"Failed to create Threads container for chunk {i//10 + 1}"
                         )
                         return False
+
+                except Exception as e:
+                    logging.error(
+                        f"Failed to process Threads chunk {i//10 + 1}: {str(e)}"
+                    )
+                    return False
 
             logging.info("Successfully posted to Threads")
             return True
@@ -608,6 +554,181 @@ class FIADocumentHandler:
         except Exception as e:
             logging.error(f"Failed to post to Threads: {str(e)}")
             return False
+
+    def _create_threads_image_container(self, image_path, text, reply_to_id=None):
+        """Create a single image container for Threads"""
+        try:
+            # Upload image to Imgur
+            image_url = self._upload_image_to_public_url(image_path)
+            if not image_url:
+                logging.error("Failed to upload image to public URL")
+                return None
+
+            # Create container
+            url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/threads"
+
+            data = {
+                "media_type": "IMAGE",
+                "image_url": image_url,
+                "text": text,
+                "access_token": self.threads_access_token,
+            }
+
+            if reply_to_id:
+                data["reply_to_id"] = reply_to_id
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+            container_id = result.get("id")
+
+            if container_id:
+                logging.info(f"Created Threads image container: {container_id}")
+
+            return container_id
+
+        except Exception as e:
+            logging.error(f"Failed to create Threads image container: {str(e)}")
+            return None
+
+    def _create_threads_carousel_container(self, image_paths, text, reply_to_id=None):
+        """Create a carousel container for Threads with multiple images"""
+        try:
+            # First, create individual media containers for each image
+            children_ids = []
+
+            for i, image_path in enumerate(image_paths):
+                image_url = self._upload_image_to_public_url(image_path)
+                if not image_url:
+                    logging.warning(f"Skipping image {image_path} - upload failed")
+                    continue
+
+                # Create individual media container
+                url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/threads"
+                data = {
+                    "media_type": "IMAGE",
+                    "image_url": image_url,
+                    "is_carousel_item": "true",
+                    "access_token": self.threads_access_token,
+                }
+
+                response = requests.post(url, data=data)
+                response.raise_for_status()
+
+                result = response.json()
+                child_id = result.get("id")
+                if child_id:
+                    children_ids.append(child_id)
+                    logging.info(f"Created carousel item {i+1}: {child_id}")
+
+            if not children_ids:
+                logging.error("No images were successfully uploaded for carousel")
+                return None
+
+            # Create carousel container
+            url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/threads"
+            data = {
+                "media_type": "CAROUSEL",
+                "children": ",".join(children_ids),
+                "text": text,
+                "access_token": self.threads_access_token,
+            }
+
+            if reply_to_id:
+                data["reply_to_id"] = reply_to_id
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+            container_id = result.get("id")
+
+            if container_id:
+                logging.info(f"Created Threads carousel container: {container_id}")
+
+            return container_id
+
+        except Exception as e:
+            logging.error(f"Failed to create Threads carousel container: {str(e)}")
+            return None
+
+    def _publish_threads_container(self, container_id):
+        """Publish a Threads container"""
+        try:
+            url = (
+                f"https://graph.threads.net/v1.0/{self.threads_user_id}/threads_publish"
+            )
+            data = {
+                "creation_id": container_id,
+                "access_token": self.threads_access_token,
+            }
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+            post_id = result.get("id")
+
+            if post_id:
+                logging.info(f"Published Threads post: {post_id}")
+
+            return post_id
+
+        except Exception as e:
+            logging.error(
+                f"Failed to publish Threads container {container_id}: {str(e)}"
+            )
+            return None
+
+    def _upload_image_to_public_url(self, image_path):
+        """
+        Upload image to Imgur and return public URL
+        Uses Imgur's free anonymous upload API
+        """
+        try:
+            # Imgur anonymous upload endpoint
+            url = "https://api.imgur.com/3/image"
+
+            # You can use this anonymous client ID for testing
+            # For production, get your own from https://api.imgur.com/oauth2/addclient
+            client_id = "546c25a59c58ad7"  # Anonymous client ID
+
+            headers = {"Authorization": f"Client-ID {client_id}"}
+
+            # Read and encode image
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+
+            # Prepare data for upload
+            files = {"image": image_data}
+
+            data = {
+                "type": "file",
+                "title": f"FIA Document - {os.path.basename(image_path)}",
+                "description": "Uploaded via FIA Document Handler",
+            }
+
+            # Upload to Imgur
+            response = requests.post(url, headers=headers, files=files, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+
+            if result.get("success"):
+                image_url = result["data"]["link"]
+                logging.info(f"Successfully uploaded image to Imgur: {image_url}")
+                return image_url
+            else:
+                logging.error(f"Imgur upload failed: {result}")
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to upload image to Imgur: {str(e)}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error uploading to Imgur: {str(e)}")
+            return None
 
     def post_to_social_media(self, image_paths, doc_url, doc_info=None):
         """Post to all available social media platforms"""
