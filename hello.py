@@ -25,8 +25,13 @@ class FIADocumentHandler:
         self.processed_docs = self._load_processed_docs()
         self.bluesky_client = Client()
         self.mastodon_client = None
+        self.threads_app_id = None
+        self.threads_app_secret = None
+        self.threads_access_token = None
+        self.threads_user_id = None
         self.bluesky_authenticated = False
         self.mastodon_authenticated = False
+        self.threads_authenticated = False
 
     def _load_processed_docs(self):
         try:
@@ -97,6 +102,43 @@ class FIADocumentHandler:
                     return False
                 logging.warning(
                     f"Mastodon authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
+
+    def authenticate_threads(self, app_id, app_secret, access_token, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                self.threads_app_id = app_id
+                self.threads_app_secret = app_secret
+                self.threads_access_token = access_token
+
+                # Get user ID from access token
+                url = f"https://graph.threads.net/v1.0/me?access_token={access_token}"
+                response = requests.get(url)
+                response.raise_for_status()
+
+                user_data = response.json()
+                self.threads_user_id = user_data.get("id")
+
+                if not self.threads_user_id:
+                    raise Exception("Could not retrieve user ID from Threads API")
+
+                logging.info(
+                    f"Successfully authenticated with Threads (User ID: {self.threads_user_id})"
+                )
+                self.threads_authenticated = True
+                return True
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Threads after {max_retries} attempts: {str(e)}"
+                    )
+                    self.threads_authenticated = False
+                    return False
+                logging.warning(
+                    f"Threads authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
                 )
                 time.sleep(2**attempt)
         return False
@@ -425,6 +467,148 @@ class FIADocumentHandler:
             logging.error(f"Failed to post to Mastodon: {str(e)}")
             return False
 
+    def post_to_threads(self, image_paths, doc_url, doc_info=None):
+        if not self.threads_authenticated:
+            logging.warning("Skipping Threads post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+            gp_hashtag = self._get_current_gp_hashtag()
+
+            max_title_length = 200
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
+
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+            formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+
+            # Threads has a 500 character limit
+            if len(formatted_text) + len(doc_url) + 1 <= 480:
+                formatted_text += f"\n\n{doc_url}"
+
+            # Upload images to Threads and create posts
+            root_post_id = None
+            parent_post_id = None
+
+            for i in range(
+                0, len(image_paths), 10
+            ):  # Threads allows up to 10 images per post
+                chunk = image_paths[i : i + 10]
+                media_ids = []
+
+                # Upload images for this chunk
+                for img_path in chunk:
+                    try:
+                        # Step 1: Upload image to Threads
+                        with open(img_path, "rb") as f:
+                            files = {"image": f}
+                            data = {
+                                "access_token": self.threads_access_token,
+                                "image_url": "",  # We're uploading directly
+                            }
+
+                            upload_url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/media"
+                            upload_response = requests.post(
+                                upload_url,
+                                files=files,
+                                data={
+                                    "access_token": self.threads_access_token,
+                                    "media_type": "IMAGE",
+                                },
+                            )
+
+                            if upload_response.status_code == 200:
+                                media_data = upload_response.json()
+                                media_ids.append(media_data.get("id"))
+                            else:
+                                logging.warning(
+                                    f"Failed to upload image {img_path} to Threads: {upload_response.text}"
+                                )
+                                continue
+
+                    except Exception as e:
+                        logging.warning(
+                            f"Failed to upload image {img_path} to Threads: {str(e)}"
+                        )
+                        continue
+
+                # Create post with uploaded images
+                if media_ids:
+                    try:
+                        post_data = {
+                            "access_token": self.threads_access_token,
+                            "media_type": "CAROUSEL" if len(media_ids) > 1 else "IMAGE",
+                        }
+
+                        if len(media_ids) == 1:
+                            post_data["image_url"] = media_ids[0]
+                        else:
+                            post_data["children"] = media_ids
+
+                        # Add text for the first post or continuation text for subsequent posts
+                        if parent_post_id:
+                            post_data["text"] = (
+                                f"Continued... ({i//10 + 1}/{(len(image_paths) + 9)//10})"
+                            )
+                            post_data["reply_to_id"] = parent_post_id
+                        else:
+                            post_data["text"] = formatted_text
+
+                        # Create media container
+                        create_url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/media"
+                        create_response = requests.post(create_url, data=post_data)
+
+                        if create_response.status_code == 200:
+                            container_data = create_response.json()
+                            container_id = container_data.get("id")
+
+                            # Publish the post
+                            publish_data = {
+                                "access_token": self.threads_access_token,
+                                "creation_id": container_id,
+                            }
+
+                            publish_url = f"https://graph.threads.net/v1.0/{self.threads_user_id}/media_publish"
+                            publish_response = requests.post(
+                                publish_url, data=publish_data
+                            )
+
+                            if publish_response.status_code == 200:
+                                publish_data = publish_response.json()
+                                post_id = publish_data.get("id")
+
+                                if not root_post_id:
+                                    root_post_id = post_id
+                                parent_post_id = post_id
+
+                                logging.info(
+                                    f"Successfully posted chunk {i//10 + 1} to Threads"
+                                )
+                            else:
+                                logging.error(
+                                    f"Failed to publish Threads post: {publish_response.text}"
+                                )
+                                return False
+                        else:
+                            logging.error(
+                                f"Failed to create Threads media container: {create_response.text}"
+                            )
+                            return False
+
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to create Threads post for chunk {i//10 + 1}: {str(e)}"
+                        )
+                        return False
+
+            logging.info("Successfully posted to Threads")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Threads: {str(e)}")
+            return False
+
     def post_to_social_media(self, image_paths, doc_url, doc_info=None):
         """Post to all available social media platforms"""
         results = {}
@@ -453,6 +637,18 @@ class FIADocumentHandler:
         else:
             results["mastodon"] = False
 
+        # Post to Threads
+        if self.threads_authenticated:
+            try:
+                results["threads"] = self.post_to_threads(
+                    image_paths, doc_url, doc_info
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Threads: {str(e)}")
+                results["threads"] = False
+        else:
+            results["threads"] = False
+
         # Log results
         successful_platforms = [
             platform for platform, success in results.items() if success
@@ -479,7 +675,8 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -497,7 +694,8 @@ def main():
 
     # Authenticate with Mastodon
     try:
-        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
+        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -509,6 +707,23 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error during Mastodon authentication: {str(e)}")
         auth_results["mastodon"] = False
+
+    # Authenticate with Threads
+    try:
+        threads_app_id = os.environ.get("THREADS_APP_ID")
+        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+
+        if threads_app_id and threads_app_secret and threads_access_token:
+            auth_results["threads"] = handler.authenticate_threads(
+                threads_app_id, threads_app_secret, threads_access_token, max_retries=3
+            )
+        else:
+            logging.warning("Threads credentials not found in environment variables")
+            auth_results["threads"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Threads authentication: {str(e)}")
+        auth_results["threads"] = False
 
     # Check if at least one platform is authenticated
     if not any(auth_results.values()):
