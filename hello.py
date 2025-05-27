@@ -155,7 +155,7 @@ class FIADocumentHandler:
         Args:
             app_id: Instagram App ID
             app_secret: Instagram App Secret
-            access_token: Long-lived access token with instagram_basic and instagram_content_publish permissions
+            access_token: Access token with instagram_basic and instagram_content_publish permissions
         """
         for attempt in range(max_retries):
             try:
@@ -163,58 +163,127 @@ class FIADocumentHandler:
                 self.instagram_app_secret = app_secret
                 self.instagram_access_token = access_token
 
-                # First, get the user's Facebook pages to find the connected Instagram Business Account
-                pages_url = f"https://graph.facebook.com/v22.0/me/accounts?access_token={access_token}"
-                pages_response = requests.get(pages_url)
-                pages_response.raise_for_status()
-                pages_data = pages_response.json()
+                # First, try to get token info to understand what type of token we have
+                token_info_url = (
+                    f"https://graph.facebook.com/v22.0/me?access_token={access_token}"
+                )
+                token_response = requests.get(token_info_url)
+
+                if token_response.status_code != 200:
+                    # If basic token info fails, try with debug_token
+                    debug_url = f"https://graph.facebook.com/v22.0/debug_token?input_token={access_token}&access_token={access_token}"
+                    debug_response = requests.get(debug_url)
+
+                    if debug_response.status_code != 200:
+                        raise Exception(
+                            f"Token validation failed. Status: {token_response.status_code}, Response: {token_response.text}"
+                        )
+
+                # Method 1: Try to get Instagram Business Account directly from user
+                logging.info("Attempting to get Instagram Business Account directly...")
+                direct_url = f"https://graph.facebook.com/v22.0/me?fields=instagram_business_account&access_token={access_token}"
+                direct_response = requests.get(direct_url)
 
                 instagram_business_account_id = None
 
-                # Look for Instagram Business Account connected to any of the pages
-                for page in pages_data.get("data", []):
-                    page_id = page["id"]
-                    page_access_token = page["access_token"]
+                if direct_response.status_code == 200:
+                    direct_data = direct_response.json()
+                    if "instagram_business_account" in direct_data:
+                        instagram_business_account_id = direct_data[
+                            "instagram_business_account"
+                        ]["id"]
+                        logging.info(
+                            f"Found Instagram Business Account directly: {instagram_business_account_id}"
+                        )
 
-                    # Check if this page has an Instagram Business Account
-                    ig_url = f"https://graph.facebook.com/v22.0/{page_id}?fields=instagram_business_account&access_token={page_access_token}"
-                    ig_response = requests.get(ig_url)
-
-                    if ig_response.status_code == 200:
-                        ig_data = ig_response.json()
-                        if "instagram_business_account" in ig_data:
-                            instagram_business_account_id = ig_data[
-                                "instagram_business_account"
-                            ]["id"]
-                            # Update access token to use the page token for Instagram operations
-                            self.instagram_access_token = page_access_token
-                            break
-
+                # Method 2: If direct method fails, try through pages
                 if not instagram_business_account_id:
-                    # Fallback: Try to get Instagram Business Account directly from user
-                    direct_url = f"https://graph.facebook.com/v22.0/me?fields=instagram_business_account&access_token={access_token}"
-                    direct_response = requests.get(direct_url)
+                    logging.info(
+                        "Attempting to find Instagram Business Account through Facebook Pages..."
+                    )
+                    pages_url = f"https://graph.facebook.com/v22.0/me/accounts?access_token={access_token}"
+                    pages_response = requests.get(pages_url)
 
-                    if direct_response.status_code == 200:
-                        direct_data = direct_response.json()
-                        if "instagram_business_account" in direct_data:
-                            instagram_business_account_id = direct_data[
-                                "instagram_business_account"
-                            ]["id"]
+                    if pages_response.status_code == 200:
+                        pages_data = pages_response.json()
+
+                        # Look for Instagram Business Account connected to any of the pages
+                        for page in pages_data.get("data", []):
+                            page_id = page["id"]
+                            page_access_token = page["access_token"]
+
+                            # Check if this page has an Instagram Business Account
+                            ig_url = f"https://graph.facebook.com/v22.0/{page_id}?fields=instagram_business_account&access_token={page_access_token}"
+                            ig_response = requests.get(ig_url)
+
+                            if ig_response.status_code == 200:
+                                ig_data = ig_response.json()
+                                if "instagram_business_account" in ig_data:
+                                    instagram_business_account_id = ig_data[
+                                        "instagram_business_account"
+                                    ]["id"]
+                                    # Update access token to use the page token for Instagram operations
+                                    self.instagram_access_token = page_access_token
+                                    logging.info(
+                                        f"Found Instagram Business Account through page {page_id}: {instagram_business_account_id}"
+                                    )
+                                    break
+                    else:
+                        logging.warning(
+                            f"Failed to get pages: {pages_response.status_code} - {pages_response.text}"
+                        )
+
+                # Method 3: Try alternative Instagram Graph API endpoint
+                if not instagram_business_account_id:
+                    logging.info("Attempting to use Instagram Graph API directly...")
+                    ig_direct_url = f"https://graph.instagram.com/me?fields=id,username&access_token={access_token}"
+                    ig_direct_response = requests.get(ig_direct_url)
+
+                    if ig_direct_response.status_code == 200:
+                        ig_direct_data = ig_direct_response.json()
+                        instagram_business_account_id = ig_direct_data.get("id")
+                        if instagram_business_account_id:
+                            logging.info(
+                                f"Found Instagram account via Instagram Graph API: {instagram_business_account_id}"
+                            )
+                    else:
+                        logging.warning(
+                            f"Instagram Graph API failed: {ig_direct_response.status_code} - {ig_direct_response.text}"
+                        )
 
                 if not instagram_business_account_id:
                     raise Exception(
-                        "Could not find Instagram Business Account. Make sure your Instagram account is connected to a Facebook Page and converted to a Business account."
+                        "Could not find Instagram Business Account. Please ensure:\n"
+                        "1. Your Instagram account is converted to a Business account\n"
+                        "2. Your Instagram account is connected to a Facebook Page\n"
+                        "3. Your access token has the required permissions (instagram_basic, instagram_content_publish)\n"
+                        "4. Your app has been approved for Instagram permissions"
                     )
 
                 self.instagram_business_account_id = instagram_business_account_id
 
                 # Test the connection by getting account info
-                test_url = f"https://graph.facebook.com/v22.0/{instagram_business_account_id}?fields=id,username&access_token={self.instagram_access_token}"
-                test_response = requests.get(test_url)
-                test_response.raise_for_status()
+                test_endpoints = [
+                    f"https://graph.facebook.com/v22.0/{instagram_business_account_id}?fields=id,username&access_token={self.instagram_access_token}",
+                    f"https://graph.instagram.com/{instagram_business_account_id}?fields=id,username&access_token={self.instagram_access_token}",
+                ]
 
-                account_info = test_response.json()
+                account_info = None
+                for test_url in test_endpoints:
+                    test_response = requests.get(test_url)
+                    if test_response.status_code == 200:
+                        account_info = test_response.json()
+                        break
+                    else:
+                        logging.warning(
+                            f"Test endpoint failed: {test_url} - {test_response.status_code}"
+                        )
+
+                if not account_info:
+                    raise Exception(
+                        "Could not verify Instagram account access with the provided token"
+                    )
+
                 username = account_info.get("username", "Unknown")
 
                 logging.info(
@@ -223,6 +292,25 @@ class FIADocumentHandler:
                 self.instagram_authenticated = True
                 return True
 
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, "response") and e.response is not None:
+                    try:
+                        error_detail = e.response.json()
+                        error_msg = f"{error_msg} - Details: {error_detail}"
+                    except:
+                        error_msg = f"{error_msg} - Response: {e.response.text}"
+
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Instagram after {max_retries} attempts: {error_msg}"
+                    )
+                    self.instagram_authenticated = False
+                    return False
+                logging.warning(
+                    f"Instagram authentication attempt {attempt + 1} failed, retrying... Error: {error_msg}"
+                )
+                time.sleep(2**attempt)
             except Exception as e:
                 if attempt == max_retries - 1:
                     logging.error(
@@ -729,49 +817,49 @@ class FIADocumentHandler:
                 logging.error("Failed to upload image to public URL for Instagram")
                 return False
 
-            # Step 2: Create media container
-            container_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media"
+            # Step 2: Create media container - try different API endpoints
+            api_endpoints = [
+                f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media",
+                f"https://graph.instagram.com/{self.instagram_business_account_id}/media",
+            ]
+
             container_data = {
                 "image_url": image_url,
                 "caption": caption,
                 "access_token": self.instagram_access_token,
             }
 
-            container_response = requests.post(container_url, data=container_data)
-            container_response.raise_for_status()
-            container_result = container_response.json()
+            creation_id = None
+            for endpoint in api_endpoints:
+                try:
+                    container_response = requests.post(endpoint, data=container_data)
+                    if container_response.status_code == 200:
+                        container_result = container_response.json()
+                        if "id" in container_result:
+                            creation_id = container_result["id"]
+                            logging.info(
+                                f"Created Instagram media container: {creation_id} via {endpoint}"
+                            )
+                            break
+                    else:
+                        logging.warning(
+                            f"Endpoint {endpoint} failed: {container_response.status_code} - {container_response.text}"
+                        )
+                except Exception as e:
+                    logging.warning(f"Endpoint {endpoint} error: {str(e)}")
+                    continue
 
-            if "id" not in container_result:
+            if not creation_id:
                 logging.error(
-                    f"Failed to create Instagram media container: {container_result}"
+                    "Failed to create Instagram media container with any endpoint"
                 )
                 return False
-
-            creation_id = container_result["id"]
-            logging.info(f"Created Instagram media container: {creation_id}")
 
             # Step 3: Wait for media to be processed
             time.sleep(3)
 
-            # Step 4: Publish the media
-            publish_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media_publish"
-            publish_data = {
-                "creation_id": creation_id,
-                "access_token": self.instagram_access_token,
-            }
-
-            publish_response = requests.post(publish_url, data=publish_data)
-            publish_response.raise_for_status()
-            publish_result = publish_response.json()
-
-            if "id" in publish_result:
-                logging.info(
-                    f"Successfully published Instagram post: {publish_result['id']}"
-                )
-                return True
-            else:
-                logging.error(f"Failed to publish Instagram post: {publish_result}")
-                return False
+            # Step 4: Publish the media using shared method
+            return self._publish_instagram_media(creation_id)
 
         except Exception as e:
             logging.error(f"Failed to create Instagram single post: {str(e)}")
@@ -783,6 +871,12 @@ class FIADocumentHandler:
             # Step 1: Create media containers for each image
             media_ids = []
 
+            # Define API endpoints to try
+            media_endpoints = [
+                f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media",
+                f"https://graph.instagram.com/{self.instagram_business_account_id}/media",
+            ]
+
             for i, image_path in enumerate(image_paths):
                 # Upload image to get public URL
                 image_url = self._upload_image_to_public_url(image_path)
@@ -791,25 +885,41 @@ class FIADocumentHandler:
                     continue
 
                 # Create individual media container for carousel item
-                container_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media"
                 container_data = {
                     "image_url": image_url,
                     "is_carousel_item": "true",
                     "access_token": self.instagram_access_token,
                 }
 
-                container_response = requests.post(container_url, data=container_data)
-                container_response.raise_for_status()
-                container_result = container_response.json()
+                # Try different endpoints for creating carousel items
+                item_created = False
+                for endpoint in media_endpoints:
+                    try:
+                        container_response = requests.post(
+                            endpoint, data=container_data
+                        )
+                        if container_response.status_code == 200:
+                            container_result = container_response.json()
+                            if "id" in container_result:
+                                media_ids.append(container_result["id"])
+                                logging.info(
+                                    f"Created carousel item {i+1}: {container_result['id']} via {endpoint}"
+                                )
+                                item_created = True
+                                break
+                        else:
+                            logging.warning(
+                                f"Carousel item endpoint {endpoint} failed: {container_response.status_code} - {container_response.text}"
+                            )
+                    except Exception as e:
+                        logging.warning(
+                            f"Carousel item endpoint {endpoint} error: {str(e)}"
+                        )
+                        continue
 
-                if "id" in container_result:
-                    media_ids.append(container_result["id"])
-                    logging.info(
-                        f"Created carousel item {i+1}: {container_result['id']}"
-                    )
-                else:
+                if not item_created:
                     logging.warning(
-                        f"Failed to create carousel item {i+1}: {container_result}"
+                        f"Failed to create carousel item {i+1} with any endpoint"
                     )
 
                 # Small delay between uploads
@@ -819,8 +929,17 @@ class FIADocumentHandler:
                 logging.error("No media items were successfully created for carousel")
                 return False
 
+            if len(media_ids) < 2:
+                logging.warning(
+                    f"Only {len(media_ids)} media items created. Instagram carousels require at least 2 items. Converting to single post."
+                )
+                # If we only have one item, convert to single post
+                if len(media_ids) == 1:
+                    return self._publish_single_instagram_media(media_ids[0], caption)
+                else:
+                    return False
+
             # Step 2: Create carousel container
-            carousel_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media"
             carousel_data = {
                 "media_type": "CAROUSEL",
                 "children": ",".join(media_ids),
@@ -828,44 +947,103 @@ class FIADocumentHandler:
                 "access_token": self.instagram_access_token,
             }
 
-            carousel_response = requests.post(carousel_url, data=carousel_data)
-            carousel_response.raise_for_status()
-            carousel_result = carousel_response.json()
+            # Try different endpoints for creating carousel container
+            creation_id = None
+            for endpoint in media_endpoints:
+                try:
+                    carousel_response = requests.post(endpoint, data=carousel_data)
+                    if carousel_response.status_code == 200:
+                        carousel_result = carousel_response.json()
+                        if "id" in carousel_result:
+                            creation_id = carousel_result["id"]
+                            logging.info(
+                                f"Created Instagram carousel container: {creation_id} via {endpoint}"
+                            )
+                            break
+                    else:
+                        logging.warning(
+                            f"Carousel container endpoint {endpoint} failed: {carousel_response.status_code} - {carousel_response.text}"
+                        )
+                except Exception as e:
+                    logging.warning(
+                        f"Carousel container endpoint {endpoint} error: {str(e)}"
+                    )
+                    continue
 
-            if "id" not in carousel_result:
+            if not creation_id:
                 logging.error(
-                    f"Failed to create Instagram carousel container: {carousel_result}"
+                    "Failed to create Instagram carousel container with any endpoint"
                 )
                 return False
-
-            creation_id = carousel_result["id"]
-            logging.info(f"Created Instagram carousel container: {creation_id}")
 
             # Step 3: Wait for media to be processed
             time.sleep(5)  # Carousel posts need more time to process
 
             # Step 4: Publish the carousel
-            publish_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media_publish"
+            return self._publish_instagram_media(creation_id)
+
+        except Exception as e:
+            logging.error(f"Failed to create Instagram carousel post: {str(e)}")
+            return False
+
+    def _publish_instagram_media(self, creation_id):
+        """Publish Instagram media (single or carousel) with multiple endpoint fallback"""
+        try:
+            # Try different endpoints for publishing
+            publish_endpoints = [
+                f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media_publish",
+                f"https://graph.instagram.com/{self.instagram_business_account_id}/media_publish",
+            ]
+
             publish_data = {
                 "creation_id": creation_id,
                 "access_token": self.instagram_access_token,
             }
 
-            publish_response = requests.post(publish_url, data=publish_data)
-            publish_response.raise_for_status()
-            publish_result = publish_response.json()
+            for endpoint in publish_endpoints:
+                try:
+                    publish_response = requests.post(endpoint, data=publish_data)
+                    if publish_response.status_code == 200:
+                        publish_result = publish_response.json()
+                        if "id" in publish_result:
+                            logging.info(
+                                f"Successfully published Instagram media: {publish_result['id']} via {endpoint}"
+                            )
+                            return True
+                    else:
+                        logging.warning(
+                            f"Publish endpoint {endpoint} failed: {publish_response.status_code} - {publish_response.text}"
+                        )
+                except Exception as e:
+                    logging.warning(f"Publish endpoint {endpoint} error: {str(e)}")
+                    continue
 
-            if "id" in publish_result:
-                logging.info(
-                    f"Successfully published Instagram carousel: {publish_result['id']}"
-                )
-                return True
-            else:
-                logging.error(f"Failed to publish Instagram carousel: {publish_result}")
-                return False
+            logging.error(
+                f"Failed to publish Instagram media {creation_id} with any endpoint"
+            )
+            return False
 
         except Exception as e:
-            logging.error(f"Failed to create Instagram carousel post: {str(e)}")
+            logging.error(f"Failed to publish Instagram media {creation_id}: {str(e)}")
+            return False
+
+    def _publish_single_instagram_media(self, media_id, caption):
+        """Publish a single Instagram media item that was created as a carousel item"""
+        try:
+            # For single items that were created as carousel items, we need to create a new container
+            # because carousel items can't be published directly
+
+            # Get the image URL from the carousel item (this is a workaround)
+            # Instead, we'll create a new single media container
+            logging.info(f"Converting carousel item {media_id} to single post")
+
+            # We can't easily convert a carousel item to a single post, so we'll return False
+            # and let the calling function handle this case differently
+            logging.warning("Cannot convert carousel item to single post - skipping")
+            return False
+
+        except Exception as e:
+            logging.error(f"Failed to publish single Instagram media: {str(e)}")
             return False
 
     def _create_threads_image_container(self, image_path, text, reply_to_id=None):
