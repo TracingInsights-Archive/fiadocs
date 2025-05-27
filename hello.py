@@ -29,9 +29,14 @@ class FIADocumentHandler:
         self.threads_app_secret = None
         self.threads_access_token = None
         self.threads_user_id = None
+        self.instagram_app_id = None
+        self.instagram_app_secret = None
+        self.instagram_access_token = None
+        self.instagram_business_account_id = None
         self.bluesky_authenticated = False
         self.mastodon_authenticated = False
         self.threads_authenticated = False
+        self.instagram_authenticated = False
 
     def _load_processed_docs(self):
         try:
@@ -139,6 +144,94 @@ class FIADocumentHandler:
                     return False
                 logging.warning(
                     f"Threads authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
+
+    def authenticate_instagram(self, app_id, app_secret, access_token, max_retries=3):
+        """
+        Authenticate with Instagram Business API
+
+        Args:
+            app_id: Instagram App ID
+            app_secret: Instagram App Secret
+            access_token: Long-lived access token with instagram_basic and instagram_content_publish permissions
+        """
+        for attempt in range(max_retries):
+            try:
+                self.instagram_app_id = app_id
+                self.instagram_app_secret = app_secret
+                self.instagram_access_token = access_token
+
+                # First, get the user's Facebook pages to find the connected Instagram Business Account
+                pages_url = f"https://graph.facebook.com/v22.0/me/accounts?access_token={access_token}"
+                pages_response = requests.get(pages_url)
+                pages_response.raise_for_status()
+                pages_data = pages_response.json()
+
+                instagram_business_account_id = None
+
+                # Look for Instagram Business Account connected to any of the pages
+                for page in pages_data.get("data", []):
+                    page_id = page["id"]
+                    page_access_token = page["access_token"]
+
+                    # Check if this page has an Instagram Business Account
+                    ig_url = f"https://graph.facebook.com/v22.0/{page_id}?fields=instagram_business_account&access_token={page_access_token}"
+                    ig_response = requests.get(ig_url)
+
+                    if ig_response.status_code == 200:
+                        ig_data = ig_response.json()
+                        if "instagram_business_account" in ig_data:
+                            instagram_business_account_id = ig_data[
+                                "instagram_business_account"
+                            ]["id"]
+                            # Update access token to use the page token for Instagram operations
+                            self.instagram_access_token = page_access_token
+                            break
+
+                if not instagram_business_account_id:
+                    # Fallback: Try to get Instagram Business Account directly from user
+                    direct_url = f"https://graph.facebook.com/v22.0/me?fields=instagram_business_account&access_token={access_token}"
+                    direct_response = requests.get(direct_url)
+
+                    if direct_response.status_code == 200:
+                        direct_data = direct_response.json()
+                        if "instagram_business_account" in direct_data:
+                            instagram_business_account_id = direct_data[
+                                "instagram_business_account"
+                            ]["id"]
+
+                if not instagram_business_account_id:
+                    raise Exception(
+                        "Could not find Instagram Business Account. Make sure your Instagram account is connected to a Facebook Page and converted to a Business account."
+                    )
+
+                self.instagram_business_account_id = instagram_business_account_id
+
+                # Test the connection by getting account info
+                test_url = f"https://graph.facebook.com/v22.0/{instagram_business_account_id}?fields=id,username&access_token={self.instagram_access_token}"
+                test_response = requests.get(test_url)
+                test_response.raise_for_status()
+
+                account_info = test_response.json()
+                username = account_info.get("username", "Unknown")
+
+                logging.info(
+                    f"Successfully authenticated with Instagram Business Account: @{username} (ID: {instagram_business_account_id})"
+                )
+                self.instagram_authenticated = True
+                return True
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Instagram after {max_retries} attempts: {str(e)}"
+                    )
+                    self.instagram_authenticated = False
+                    return False
+                logging.warning(
+                    f"Instagram authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
                 )
                 time.sleep(2**attempt)
         return False
@@ -555,6 +648,226 @@ class FIADocumentHandler:
             logging.error(f"Failed to post to Threads: {str(e)}")
             return False
 
+    def post_to_instagram(self, image_paths, doc_url, doc_info=None):
+        """
+        Post to Instagram using the Instagram Basic Display API
+        Instagram supports carousel posts (up to 10 images) and single image posts
+        """
+        if not self.instagram_authenticated:
+            logging.warning("Skipping Instagram post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+
+            max_title_length = 1500  # Instagram captions should be concise
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
+
+            # Instagram hashtags work differently - they should be at the end
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+
+            # Create caption with proper Instagram formatting
+            caption = f"{doc_title}\n\nPublished: {pub_date}\n\n{all_hashtags}"
+
+            # Instagram has a 2200 character limit for captions
+            if len(caption) + len(doc_url) + 10 <= 2150:  # Leave some buffer
+                caption += f"\n\nSource: {doc_url}"
+
+            # Process images in chunks (Instagram allows up to 10 images per carousel)
+            for i in range(0, len(image_paths), 10):
+                chunk = image_paths[i : i + 10]
+
+                try:
+                    # Add delay between posts to respect rate limits
+                    if i > 0:
+                        time.sleep(5)  # Instagram has stricter rate limits
+
+                    # Determine caption for this chunk
+                    chunk_caption = (
+                        caption
+                        if i == 0
+                        else f"{doc_title} (Part {i//10 + 1})\n\n{all_hashtags}"
+                    )
+
+                    if len(chunk) == 1:
+                        # Single image post
+                        success = self._create_instagram_single_post(
+                            chunk[0], chunk_caption
+                        )
+                    else:
+                        # Carousel post
+                        success = self._create_instagram_carousel_post(
+                            chunk, chunk_caption
+                        )
+
+                    if success:
+                        logging.info(f"Successfully posted Instagram chunk {i//10 + 1}")
+                    else:
+                        logging.error(f"Failed to post Instagram chunk {i//10 + 1}")
+                        return False
+
+                except Exception as e:
+                    logging.error(
+                        f"Failed to process Instagram chunk {i//10 + 1}: {str(e)}"
+                    )
+                    return False
+
+            logging.info("Successfully posted to Instagram")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Instagram: {str(e)}")
+            return False
+
+    def _create_instagram_single_post(self, image_path, caption):
+        """Create a single image post on Instagram"""
+        try:
+            # Step 1: Upload image to get a public URL (using Imgur)
+            image_url = self._upload_image_to_public_url(image_path)
+            if not image_url:
+                logging.error("Failed to upload image to public URL for Instagram")
+                return False
+
+            # Step 2: Create media container
+            container_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media"
+            container_data = {
+                "image_url": image_url,
+                "caption": caption,
+                "access_token": self.instagram_access_token,
+            }
+
+            container_response = requests.post(container_url, data=container_data)
+            container_response.raise_for_status()
+            container_result = container_response.json()
+
+            if "id" not in container_result:
+                logging.error(
+                    f"Failed to create Instagram media container: {container_result}"
+                )
+                return False
+
+            creation_id = container_result["id"]
+            logging.info(f"Created Instagram media container: {creation_id}")
+
+            # Step 3: Wait for media to be processed
+            time.sleep(3)
+
+            # Step 4: Publish the media
+            publish_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media_publish"
+            publish_data = {
+                "creation_id": creation_id,
+                "access_token": self.instagram_access_token,
+            }
+
+            publish_response = requests.post(publish_url, data=publish_data)
+            publish_response.raise_for_status()
+            publish_result = publish_response.json()
+
+            if "id" in publish_result:
+                logging.info(
+                    f"Successfully published Instagram post: {publish_result['id']}"
+                )
+                return True
+            else:
+                logging.error(f"Failed to publish Instagram post: {publish_result}")
+                return False
+
+        except Exception as e:
+            logging.error(f"Failed to create Instagram single post: {str(e)}")
+            return False
+
+    def _create_instagram_carousel_post(self, image_paths, caption):
+        """Create a carousel post on Instagram with multiple images"""
+        try:
+            # Step 1: Create media containers for each image
+            media_ids = []
+
+            for i, image_path in enumerate(image_paths):
+                # Upload image to get public URL
+                image_url = self._upload_image_to_public_url(image_path)
+                if not image_url:
+                    logging.warning(f"Skipping image {image_path} - upload failed")
+                    continue
+
+                # Create individual media container for carousel item
+                container_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media"
+                container_data = {
+                    "image_url": image_url,
+                    "is_carousel_item": "true",
+                    "access_token": self.instagram_access_token,
+                }
+
+                container_response = requests.post(container_url, data=container_data)
+                container_response.raise_for_status()
+                container_result = container_response.json()
+
+                if "id" in container_result:
+                    media_ids.append(container_result["id"])
+                    logging.info(
+                        f"Created carousel item {i+1}: {container_result['id']}"
+                    )
+                else:
+                    logging.warning(
+                        f"Failed to create carousel item {i+1}: {container_result}"
+                    )
+
+                # Small delay between uploads
+                time.sleep(1)
+
+            if not media_ids:
+                logging.error("No media items were successfully created for carousel")
+                return False
+
+            # Step 2: Create carousel container
+            carousel_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media"
+            carousel_data = {
+                "media_type": "CAROUSEL",
+                "children": ",".join(media_ids),
+                "caption": caption,
+                "access_token": self.instagram_access_token,
+            }
+
+            carousel_response = requests.post(carousel_url, data=carousel_data)
+            carousel_response.raise_for_status()
+            carousel_result = carousel_response.json()
+
+            if "id" not in carousel_result:
+                logging.error(
+                    f"Failed to create Instagram carousel container: {carousel_result}"
+                )
+                return False
+
+            creation_id = carousel_result["id"]
+            logging.info(f"Created Instagram carousel container: {creation_id}")
+
+            # Step 3: Wait for media to be processed
+            time.sleep(5)  # Carousel posts need more time to process
+
+            # Step 4: Publish the carousel
+            publish_url = f"https://graph.facebook.com/v22.0/{self.instagram_business_account_id}/media_publish"
+            publish_data = {
+                "creation_id": creation_id,
+                "access_token": self.instagram_access_token,
+            }
+
+            publish_response = requests.post(publish_url, data=publish_data)
+            publish_response.raise_for_status()
+            publish_result = publish_response.json()
+
+            if "id" in publish_result:
+                logging.info(
+                    f"Successfully published Instagram carousel: {publish_result['id']}"
+                )
+                return True
+            else:
+                logging.error(f"Failed to publish Instagram carousel: {publish_result}")
+                return False
+
+        except Exception as e:
+            logging.error(f"Failed to create Instagram carousel post: {str(e)}")
+            return False
+
     def _create_threads_image_container(self, image_path, text, reply_to_id=None):
         """Create a single image container for Threads"""
         try:
@@ -770,6 +1083,18 @@ class FIADocumentHandler:
         else:
             results["threads"] = False
 
+        # Post to Instagram
+        if self.instagram_authenticated:
+            try:
+                results["instagram"] = self.post_to_instagram(
+                    image_paths, doc_url, doc_info
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Instagram: {str(e)}")
+                results["instagram"] = False
+        else:
+            results["instagram"] = False
+
         # Log results
         successful_platforms = [
             platform for platform, success in results.items() if success
@@ -796,7 +1121,8 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -814,7 +1140,8 @@ def main():
 
     # Authenticate with Mastodon
     try:
-        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
+        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -829,9 +1156,12 @@ def main():
 
     # Authenticate with Threads
     try:
-        threads_app_id = os.environ.get("THREADS_APP_ID")
-        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
-        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+        threads_app_id = os.environ.get("BLUESKY_USERNAME")
+        threads_app_secret = os.environ.get("BLUESKY_USERNAME")
+        threads_access_token = os.environ.get("BLUESKY_USERNAME")
+        # threads_app_id = os.environ.get("THREADS_APP_ID")
+        # threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        # threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
 
         if threads_app_id and threads_app_secret and threads_access_token:
             auth_results["threads"] = handler.authenticate_threads(
@@ -843,6 +1173,26 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error during Threads authentication: {str(e)}")
         auth_results["threads"] = False
+
+    # Authenticate with Instagram
+    try:
+        instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
+        instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+        instagram_access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+
+        if instagram_app_id and instagram_app_secret and instagram_access_token:
+            auth_results["instagram"] = handler.authenticate_instagram(
+                instagram_app_id,
+                instagram_app_secret,
+                instagram_access_token,
+                max_retries=3,
+            )
+        else:
+            logging.warning("Instagram credentials not found in environment variables")
+            auth_results["instagram"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Instagram authentication: {str(e)}")
+        auth_results["instagram"] = False
 
     # Check if at least one platform is authenticated
     if not any(auth_results.values()):
