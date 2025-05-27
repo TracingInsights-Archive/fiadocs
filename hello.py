@@ -479,8 +479,7 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_USERNAME")
-        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
