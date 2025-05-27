@@ -9,6 +9,7 @@ import requests
 from atproto import Client
 from bs4 import BeautifulSoup
 from mastodon import Mastodon
+from PIL import Image
 
 # Global hashtags - Change in 2 places
 GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SpanishGP"
@@ -396,6 +397,61 @@ class FIADocumentHandler:
         os.remove(pdf_path)
         return image_paths
 
+    def _prepare_images_for_instagram(self, image_paths):
+        """
+        Prepare images specifically for Instagram by rotating landscape pages to portrait
+        Skip the first page as it's always in portrait mode and doesn't have cropping issues
+        """
+        instagram_image_paths = []
+
+        for i, image_path in enumerate(image_paths):
+            try:
+                # Load the image
+                with Image.open(image_path) as img:
+                    # Skip rotation for the first page (index 0) as it's always portrait
+                    if i == 0:
+                        # Just copy the first page as-is
+                        instagram_path = os.path.join(
+                            self.download_dir, f"instagram_page_{i}.jpg"
+                        )
+                        img.save(instagram_path, "JPEG", quality=95)
+                        instagram_image_paths.append(instagram_path)
+                        logging.info(f"Kept first page as portrait: {instagram_path}")
+                    else:
+                        # Check if the image is in landscape mode (width > height)
+                        width, height = img.size
+
+                        if width > height:
+                            # Rotate landscape image 90 degrees clockwise to make it portrait
+                            rotated_img = img.rotate(-90, expand=True)
+                            instagram_path = os.path.join(
+                                self.download_dir, f"instagram_page_{i}.jpg"
+                            )
+                            rotated_img.save(instagram_path, "JPEG", quality=95)
+                            instagram_image_paths.append(instagram_path)
+                            logging.info(
+                                f"Rotated landscape page {i} to portrait: {instagram_path}"
+                            )
+                        else:
+                            # Image is already in portrait mode, just copy it
+                            instagram_path = os.path.join(
+                                self.download_dir, f"instagram_page_{i}.jpg"
+                            )
+                            img.save(instagram_path, "JPEG", quality=95)
+                            instagram_image_paths.append(instagram_path)
+                            logging.info(
+                                f"Kept portrait page {i} as-is: {instagram_path}"
+                            )
+
+            except Exception as e:
+                logging.error(
+                    f"Error processing image {image_path} for Instagram: {str(e)}"
+                )
+                # If there's an error, use the original image
+                instagram_image_paths.append(image_path)
+
+        return instagram_image_paths
+
     def _extract_timestamp_from_doc(self, doc_url):
         filename = os.path.basename(doc_url)
         try:
@@ -746,6 +802,9 @@ class FIADocumentHandler:
             return False
 
         try:
+            # Prepare images specifically for Instagram (rotate landscape pages to portrait)
+            instagram_image_paths = self._prepare_images_for_instagram(image_paths)
+
             doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
 
             max_title_length = 1500  # Instagram captions should be concise
@@ -763,8 +822,8 @@ class FIADocumentHandler:
                 caption += f"\n\nSource: {doc_url}"
 
             # Process images in chunks (Instagram allows up to 10 images per carousel)
-            for i in range(0, len(image_paths), 10):
-                chunk = image_paths[i : i + 10]
+            for i in range(0, len(instagram_image_paths), 10):
+                chunk = instagram_image_paths[i : i + 10]
 
                 try:
                     # Add delay between posts to respect rate limits
@@ -800,6 +859,19 @@ class FIADocumentHandler:
                         f"Failed to process Instagram chunk {i//10 + 1}: {str(e)}"
                     )
                     return False
+
+            # Clean up Instagram-specific image files
+            for img_path in instagram_image_paths:
+                if img_path.startswith(
+                    os.path.join(self.download_dir, "instagram_page_")
+                ):
+                    try:
+                        os.remove(img_path)
+                        logging.debug(f"Cleaned up Instagram image: {img_path}")
+                    except Exception as e:
+                        logging.warning(
+                            f"Failed to clean up Instagram image {img_path}: {str(e)}"
+                        )
 
             logging.info("Successfully posted to Instagram")
             return True
