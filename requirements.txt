@@ -4,3 +4,4 @@ pdf2image
 atproto
 requests-oauthlib
 tweepy
+Mastodon.py

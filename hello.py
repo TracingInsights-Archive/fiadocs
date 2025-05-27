@@ -8,6 +8,7 @@ import pdf2image
 import requests
 from atproto import Client
 from bs4 import BeautifulSoup
+from mastodon import Mastodon
 
 # Global hashtags - Change in 2 places
 GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SpanishGP"
@@ -23,6 +24,9 @@ class FIADocumentHandler:
         self.download_dir = "downloads"
         self.processed_docs = self._load_processed_docs()
         self.bluesky_client = Client()
+        self.mastodon_client = None
+        self.bluesky_authenticated = False
+        self.mastodon_authenticated = False
 
     def _load_processed_docs(self):
         try:
@@ -54,14 +58,48 @@ class FIADocumentHandler:
                 self.bluesky_client = Client()
                 self.bluesky_client.login(username, password)
                 logging.info("Successfully authenticated with Bluesky")
-                return
+                self.bluesky_authenticated = True
+                return True
             except Exception as e:
                 if attempt == max_retries - 1:
-                    raise
+                    logging.error(
+                        f"Failed to authenticate with Bluesky after {max_retries} attempts: {str(e)}"
+                    )
+                    self.bluesky_authenticated = False
+                    return False
                 logging.warning(
-                    f"Authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                    f"Bluesky authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
                 )
                 time.sleep(2**attempt)
+        return False
+
+    def authenticate_mastodon(self, access_token, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                # Create Mastodon client
+                self.mastodon_client = Mastodon(
+                    access_token=access_token, api_base_url="https://mastodon.social"
+                )
+
+                # Test authentication by getting account info
+                account = self.mastodon_client.me()
+                logging.info(
+                    f"Successfully authenticated with Mastodon as @{account['username']}"
+                )
+                self.mastodon_authenticated = True
+                return True
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Mastodon after {max_retries} attempts: {str(e)}"
+                    )
+                    self.mastodon_authenticated = False
+                    return False
+                logging.warning(
+                    f"Mastodon authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
 
     def _make_filename_readable(self, filename):
         # Remove file extension
@@ -202,100 +240,286 @@ class FIADocumentHandler:
         return future_races[next_race_date]
 
     def post_to_bluesky(self, image_paths, doc_url, doc_info=None):
-        doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
-        gp_hashtag = self._get_current_gp_hashtag()
+        if not self.bluesky_authenticated:
+            logging.warning("Skipping Bluesky post - not authenticated")
+            return False
 
-        max_title_length = 200
-        if len(doc_title) > max_title_length:
-            doc_title = doc_title[: max_title_length - 3] + "..."
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+            gp_hashtag = self._get_current_gp_hashtag()
 
-        all_hashtags = f"{GLOBAL_HASHTAGS}"
-        formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+            max_title_length = 200
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
 
-        if len(formatted_text) + len(doc_url) + 1 <= 300:
-            formatted_text += f"\n\n{doc_url}"
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+            formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
 
-        encoded_doc_url = requests.utils.quote(doc_url, safe=":/?=")
-        facets = []
+            if len(formatted_text) + len(doc_url) + 1 <= 300:
+                formatted_text += f"\n\n{doc_url}"
 
-        # Add URL facet
-        url_start = formatted_text.find(doc_url)
-        if url_start != -1:
-            byte_start = len(formatted_text[:url_start].encode("utf-8"))
-            byte_end = len(formatted_text[: url_start + len(doc_url)].encode("utf-8"))
-            facets.append(
-                {
-                    "index": {"byteStart": byte_start, "byteEnd": byte_end},
-                    "features": [
-                        {
-                            "$type": "app.bsky.richtext.facet#link",
-                            "uri": encoded_doc_url,
-                        }
-                    ],
-                }
-            )
+            encoded_doc_url = requests.utils.quote(doc_url, safe=":/?=")
+            facets = []
 
-        # Make all hashtags clickable
-        all_tags = ["f1", "formula1", "fia", "SpanishGP"]
-        for tag in all_tags:
-            tag_with_hash = f"#{tag}"
-            tag_pos = formatted_text.find(tag_with_hash)
-            if tag_pos != -1:
-                byte_start = len(formatted_text[:tag_pos].encode("utf-8"))
+            # Add URL facet
+            url_start = formatted_text.find(doc_url)
+            if url_start != -1:
+                byte_start = len(formatted_text[:url_start].encode("utf-8"))
                 byte_end = len(
-                    formatted_text[: tag_pos + len(tag_with_hash)].encode("utf-8")
+                    formatted_text[: url_start + len(doc_url)].encode("utf-8")
                 )
                 facets.append(
                     {
                         "index": {"byteStart": byte_start, "byteEnd": byte_end},
                         "features": [
-                            {"$type": "app.bsky.richtext.facet#tag", "tag": tag}
+                            {
+                                "$type": "app.bsky.richtext.facet#link",
+                                "uri": encoded_doc_url,
+                            }
                         ],
                     }
                 )
 
-        root_post = None
-        parent_post = None
+            # Make all hashtags clickable
+            all_tags = ["f1", "formula1", "fia", "SpanishGP"]
+            for tag in all_tags:
+                tag_with_hash = f"#{tag}"
+                tag_pos = formatted_text.find(tag_with_hash)
+                if tag_pos != -1:
+                    byte_start = len(formatted_text[:tag_pos].encode("utf-8"))
+                    byte_end = len(
+                        formatted_text[: tag_pos + len(tag_with_hash)].encode("utf-8")
+                    )
+                    facets.append(
+                        {
+                            "index": {"byteStart": byte_start, "byteEnd": byte_end},
+                            "features": [
+                                {"$type": "app.bsky.richtext.facet#tag", "tag": tag}
+                            ],
+                        }
+                    )
 
-        for i in range(0, len(image_paths), 4):
-            chunk = image_paths[i : i + 4]
-            images = {"$type": "app.bsky.embed.images", "images": []}
+            root_post = None
+            parent_post = None
 
-            for img_path in chunk:
-                with open(img_path, "rb") as f:
-                    image_data = f.read()
-                response = self.bluesky_client.upload_blob(image_data)
-                images["images"].append({"image": response.blob, "alt": doc_title})
+            for i in range(0, len(image_paths), 4):
+                chunk = image_paths[i : i + 4]
+                images = {"$type": "app.bsky.embed.images", "images": []}
 
-            if parent_post:
-                reply = {
-                    "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
-                    "parent": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
-                }
-                post_result = self.bluesky_client.post(
-                    text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
-                    embed=images,
-                    reply_to=reply,
+                for img_path in chunk:
+                    with open(img_path, "rb") as f:
+                        image_data = f.read()
+                    response = self.bluesky_client.upload_blob(image_data)
+                    images["images"].append({"image": response.blob, "alt": doc_title})
+
+                if parent_post:
+                    reply = {
+                        "root": {"uri": root_post["uri"], "cid": root_post["cid"]},
+                        "parent": {
+                            "uri": parent_post["uri"],
+                            "cid": parent_post["cid"],
+                        },
+                    }
+                    post_result = self.bluesky_client.post(
+                        text=f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})",
+                        embed=images,
+                        reply_to=reply,
+                    )
+                    parent_post = {"uri": post_result.uri, "cid": post_result.cid}
+                else:
+                    post_result = self.bluesky_client.post(
+                        text=formatted_text, facets=facets, embed=images
+                    )
+                    root_post = {"uri": post_result.uri, "cid": post_result.cid}
+                    parent_post = root_post
+
+            logging.info("Successfully posted to Bluesky")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Bluesky: {str(e)}")
+            return False
+
+    def post_to_mastodon(self, image_paths, doc_url, doc_info=None):
+        if not self.mastodon_authenticated:
+            logging.warning("Skipping Mastodon post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+            gp_hashtag = self._get_current_gp_hashtag()
+
+            max_title_length = 200
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
+
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+            formatted_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+
+            # Mastodon has a 500 character limit
+            if len(formatted_text) + len(doc_url) + 1 <= 480:
+                formatted_text += f"\n\n{doc_url}"
+
+            # Upload images to Mastodon (max 4 per post)
+            media_ids = []
+            for i, img_path in enumerate(image_paths[:4]):  # Mastodon limit is 4 images
+                try:
+                    with open(img_path, "rb") as f:
+                        media = self.mastodon_client.media_post(
+                            f, description=doc_title
+                        )
+                        media_ids.append(media["id"])
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to upload image {img_path} to Mastodon: {str(e)}"
+                    )
+                    continue
+
+            # Post the main toot
+            if media_ids:
+                status = self.mastodon_client.status_post(
+                    status=formatted_text, media_ids=media_ids
                 )
-                parent_post = {"uri": post_result.uri, "cid": post_result.cid}
+                logging.info("Successfully posted to Mastodon")
+
+                # If there are more than 4 images, post them in reply threads
+                if len(image_paths) > 4:
+                    parent_status = status
+                    for i in range(4, len(image_paths), 4):
+                        chunk = image_paths[i : i + 4]
+                        chunk_media_ids = []
+
+                        for img_path in chunk:
+                            try:
+                                with open(img_path, "rb") as f:
+                                    media = self.mastodon_client.media_post(
+                                        f, description=doc_title
+                                    )
+                                    chunk_media_ids.append(media["id"])
+                            except Exception as e:
+                                logging.warning(
+                                    f"Failed to upload image {img_path} to Mastodon: {str(e)}"
+                                )
+                                continue
+
+                        if chunk_media_ids:
+                            reply_text = (
+                                f"Continued... ({i//4 + 1}/{(len(image_paths) + 3)//4})"
+                            )
+                            parent_status = self.mastodon_client.status_post(
+                                status=reply_text,
+                                media_ids=chunk_media_ids,
+                                in_reply_to_id=parent_status["id"],
+                            )
+
+                return True
             else:
-                post_result = self.bluesky_client.post(
-                    text=formatted_text, facets=facets, embed=images
+                # Post without media if all uploads failed
+                self.mastodon_client.status_post(status=formatted_text)
+                logging.info("Successfully posted to Mastodon (text only)")
+                return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Mastodon: {str(e)}")
+            return False
+
+    def post_to_social_media(self, image_paths, doc_url, doc_info=None):
+        """Post to all available social media platforms"""
+        results = {}
+
+        # Post to Bluesky
+        if self.bluesky_authenticated:
+            try:
+                results["bluesky"] = self.post_to_bluesky(
+                    image_paths, doc_url, doc_info
                 )
-                root_post = {"uri": post_result.uri, "cid": post_result.cid}
-                parent_post = root_post
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Bluesky: {str(e)}")
+                results["bluesky"] = False
+        else:
+            results["bluesky"] = False
+
+        # Post to Mastodon
+        if self.mastodon_authenticated:
+            try:
+                results["mastodon"] = self.post_to_mastodon(
+                    image_paths, doc_url, doc_info
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Mastodon: {str(e)}")
+                results["mastodon"] = False
+        else:
+            results["mastodon"] = False
+
+        # Log results
+        successful_platforms = [
+            platform for platform, success in results.items() if success
+        ]
+        failed_platforms = [
+            platform for platform, success in results.items() if not success
+        ]
+
+        if successful_platforms:
+            logging.info(f"Successfully posted to: {', '.join(successful_platforms)}")
+        if failed_platforms:
+            logging.warning(f"Failed to post to: {', '.join(failed_platforms)}")
+
+        return results
 
 
 def main():
     logging.info("Starting FIA Document Handler")
     handler = FIADocumentHandler()
+
+    # Track authentication results
+    auth_results = {}
+
+    # Authenticate with Bluesky
     try:
-        handler.authenticate_bluesky(
-            os.environ["BLUESKY_USERNAME"],
-            os.environ["BLUESKY_PASSWORD"],
-            max_retries=3,
-            timeout=30,
-        )
+        bluesky_username = os.environ.get("BLUESKY_USERNAME")
+        bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+
+        if bluesky_username and bluesky_password:
+            auth_results["bluesky"] = handler.authenticate_bluesky(
+                bluesky_username,
+                bluesky_password,
+                max_retries=3,
+                timeout=30,
+            )
+        else:
+            logging.warning("Bluesky credentials not found in environment variables")
+            auth_results["bluesky"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Bluesky authentication: {str(e)}")
+        auth_results["bluesky"] = False
+
+    # Authenticate with Mastodon
+    try:
+        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+
+        if mastodon_access_token:
+            auth_results["mastodon"] = handler.authenticate_mastodon(
+                mastodon_access_token, max_retries=3
+            )
+        else:
+            logging.warning("Mastodon access token not found in environment variables")
+            auth_results["mastodon"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Mastodon authentication: {str(e)}")
+        auth_results["mastodon"] = False
+
+    # Check if at least one platform is authenticated
+    if not any(auth_results.values()):
+        logging.error("Failed to authenticate with any social media platform. Exiting.")
+        return
+
+    successful_auths = [
+        platform for platform, success in auth_results.items() if success
+    ]
+    logging.info(f"Successfully authenticated with: {', '.join(successful_auths)}")
+
+    try:
         documents, document_info = handler.fetch_documents()
         unique_documents = list(dict.fromkeys(documents))
         logging.info(f"Found {len(unique_documents)} new documents to process")
@@ -309,11 +533,25 @@ def main():
                     logging.info(f"Skipping already processed document: {doc_url}")
                     continue
 
+                logging.info(f"Processing document: {doc_url}")
                 image_paths = handler.download_and_convert_pdf(doc_url)
-                handler.post_to_bluesky(image_paths, doc_url, document_info)
-                handler.processed_docs["urls"].append(doc_url)
-                handler._save_processed_docs()
 
+                # Post to all available social media platforms
+                post_results = handler.post_to_social_media(
+                    image_paths, doc_url, document_info
+                )
+
+                # Only mark as processed if at least one platform succeeded
+                if any(post_results.values()):
+                    handler.processed_docs["urls"].append(doc_url)
+                    handler._save_processed_docs()
+                    logging.info(f"Document {doc_url} marked as processed")
+                else:
+                    logging.warning(
+                        f"Failed to post document {doc_url} to any platform - not marking as processed"
+                    )
+
+                # Clean up image files
                 for img_path in image_paths:
                     if os.path.exists(img_path):
                         os.remove(img_path)
