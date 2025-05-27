@@ -365,8 +365,9 @@ class FIADocumentHandler:
             for i, img_path in enumerate(image_paths[:4]):  # Mastodon limit is 4 images
                 try:
                     with open(img_path, "rb") as f:
+                        # Explicitly specify MIME type for JPEG images
                         media = self.mastodon_client.media_post(
-                            f, description=doc_title
+                            f, mime_type="image/jpeg", description=doc_title
                         )
                         media_ids.append(media["id"])
                 except Exception as e:
@@ -392,8 +393,9 @@ class FIADocumentHandler:
                         for img_path in chunk:
                             try:
                                 with open(img_path, "rb") as f:
+                                    # Explicitly specify MIME type for JPEG images
                                     media = self.mastodon_client.media_post(
-                                        f, description=doc_title
+                                        f, mime_type="image/jpeg", description=doc_title
                                     )
                                     chunk_media_ids.append(media["id"])
                             except Exception as e:
