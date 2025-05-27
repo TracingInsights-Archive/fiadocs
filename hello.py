@@ -422,8 +422,8 @@ class FIADocumentHandler:
                         width, height = img.size
 
                         if width > height:
-                            # Rotate landscape image 90 degrees clockwise to make it portrait
-                            rotated_img = img.rotate(-90, expand=True)
+                            # Rotate landscape image 90 degrees anticlockwise to make it portrait
+                            rotated_img = img.rotate(90, expand=True)
                             instagram_path = os.path.join(
                                 self.download_dir, f"instagram_page_{i}.jpg"
                             )
