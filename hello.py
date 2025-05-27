@@ -422,8 +422,8 @@ class FIADocumentHandler:
                         width, height = img.size
 
                         if width > height:
-                            # Rotate landscape image 90 degrees anticlockwise to make it portrait
-                            rotated_img = img.rotate(90, expand=True)
+                            # Rotate landscape image 90 degrees clockwise to make it portrait
+                            rotated_img = img.rotate(-90, expand=True)
                             instagram_path = os.path.join(
                                 self.download_dir, f"instagram_page_{i}.jpg"
                             )
@@ -1371,8 +1371,7 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_USERNAME")
-        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -1390,8 +1389,8 @@ def main():
 
     # Authenticate with Mastodon
     try:
-        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
-        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+
+        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -1406,12 +1405,10 @@ def main():
 
     # Authenticate with Threads
     try:
-        threads_app_id = os.environ.get("BLUESKY_USERNAME")
-        threads_app_secret = os.environ.get("BLUESKY_USERNAME")
-        threads_access_token = os.environ.get("BLUESKY_USERNAME")
-        # threads_app_id = os.environ.get("THREADS_APP_ID")
-        # threads_app_secret = os.environ.get("THREADS_APP_SECRET")
-        # threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+
+        threads_app_id = os.environ.get("THREADS_APP_ID")
+        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
 
         if threads_app_id and threads_app_secret and threads_access_token:
             auth_results["threads"] = handler.authenticate_threads(
