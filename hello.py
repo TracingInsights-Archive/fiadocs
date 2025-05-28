@@ -36,6 +36,8 @@ class FIADocumentHandler:
         self.instagram_business_account_id = None
         self.facebook_page_id = None
         self.facebook_page_access_token = None
+        self.pixelfed_client = None
+        self.pixelfed_authenticated = False
         self.bluesky_authenticated = False
         self.mastodon_authenticated = False
         self.threads_authenticated = False
@@ -65,6 +67,37 @@ class FIADocumentHandler:
     def _save_processed_docs(self):
         with open("processed_docs.json", "w") as f:
             json.dump(self.processed_docs["urls"], f)
+
+    def authenticate_pixelfed(self, access_token, max_retries=3):
+        """
+        Authenticate with Pixelfed using access token
+        """
+        for attempt in range(max_retries):
+            try:
+                # Create Pixelfed client (uses same API as Mastodon)
+                self.pixelfed_client = Mastodon(
+                    access_token=access_token, api_base_url="https://pixelfed.social"
+                )
+
+                # Test authentication by getting account info
+                account = self.pixelfed_client.me()
+                logging.info(
+                    f"Successfully authenticated with Pixelfed as @{account['username']}"
+                )
+                self.pixelfed_authenticated = True
+                return True
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Pixelfed after {max_retries} attempts: {str(e)}"
+                    )
+                    self.pixelfed_authenticated = False
+                    return False
+                logging.warning(
+                    f"Pixelfed authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
 
     def authenticate_bluesky(self, username, password, max_retries=3, timeout=30):
         for attempt in range(max_retries):
@@ -1637,6 +1670,106 @@ class FIADocumentHandler:
             logging.error(f"Unexpected error uploading to Imgur: {str(e)}")
             return None
 
+    def post_to_pixelfed(self, image_paths, doc_url, doc_info=None):
+        """
+        Post to Pixelfed - optimized for visual content
+        Pixelfed supports up to 20 images per post, 2,000 character limit, and doesn't have threading
+        """
+        if not self.pixelfed_authenticated:
+            logging.warning("Skipping Pixelfed post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+
+            max_title_length = 1500  # Leave room for other content
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
+
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+            base_text = f"{doc_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+
+            # Pixelfed has a 2,000 character limit
+            if len(base_text) + len(doc_url) + 10 <= 1950:  # Leave some buffer
+                base_text += f"\n\nSource: {doc_url}"
+
+            # Process images in chunks of 20 (Pixelfed's limit)
+            total_chunks = (len(image_paths) + 19) // 20
+
+            for chunk_index in range(0, len(image_paths), 20):
+                chunk = image_paths[chunk_index : chunk_index + 20]
+                chunk_number = (chunk_index // 20) + 1
+
+                # Upload images to Pixelfed
+                media_ids = []
+                for i, img_path in enumerate(chunk):
+                    try:
+                        with open(img_path, "rb") as f:
+                            # Explicitly specify MIME type for JPEG images
+                            media = self.pixelfed_client.media_post(
+                                f, mime_type="image/jpeg", description=doc_title
+                            )
+                            media_ids.append(media["id"])
+                    except Exception as e:
+                        logging.warning(
+                            f"Failed to upload image {img_path} to Pixelfed: {str(e)}"
+                        )
+                        continue
+
+                # Create post text for this chunk
+                if total_chunks > 1:
+                    chunk_text = f"{base_text}\n\nPart {chunk_number}/{total_chunks}"
+                else:
+                    chunk_text = base_text
+
+                # Ensure we don't exceed 2,000 character limit
+                if len(chunk_text) > 2000:
+                    # Truncate the title if needed
+                    excess = len(chunk_text) - 2000
+                    title_reduction = excess + 50  # Extra buffer
+
+                    if len(doc_title) > title_reduction:
+                        truncated_title = (
+                            doc_title[: len(doc_title) - title_reduction - 3] + "..."
+                        )
+                        chunk_text = f"{truncated_title}\nPublished on {pub_date}\n\n{all_hashtags}"
+
+                        if total_chunks > 1:
+                            chunk_text += f"\n\nPart {chunk_number}/{total_chunks}"
+
+                        # Try to add URL if it fits
+                        if len(chunk_text) + len(doc_url) + 10 <= 2000:
+                            chunk_text += f"\n\nSource: {doc_url}"
+
+                # Post the chunk
+                if media_ids:
+                    status = self.pixelfed_client.status_post(
+                        status=chunk_text, media_ids=media_ids
+                    )
+                    logging.info(
+                        f"Successfully posted Pixelfed chunk {chunk_number}/{total_chunks} with {len(media_ids)} images"
+                    )
+                else:
+                    logging.warning(
+                        f"No images uploaded for Pixelfed chunk {chunk_number}"
+                    )
+                    if (
+                        chunk_index == 0
+                    ):  # Only post text for the first chunk if no images
+                        self.pixelfed_client.status_post(status=chunk_text)
+                        logging.info("Successfully posted to Pixelfed (text only)")
+
+                # Add delay between chunks to respect rate limits
+                if chunk_index + 20 < len(image_paths):
+                    time.sleep(3)
+
+            logging.info("Successfully completed Pixelfed posting")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Pixelfed: {str(e)}")
+            return False
+
     def post_to_social_media(self, image_paths, doc_url, doc_info=None):
         """Post to all available social media platforms"""
         results = {}
@@ -1700,6 +1833,18 @@ class FIADocumentHandler:
         else:
             results["facebook"] = False
 
+        # Post to Pixelfed
+        if self.pixelfed_authenticated:
+            try:
+                results["pixelfed"] = self.post_to_pixelfed(
+                    image_paths, doc_url, doc_info
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Pixelfed: {str(e)}")
+                results["pixelfed"] = False
+        else:
+            results["pixelfed"] = False
+
         # Log results
         successful_platforms = [
             platform for platform, success in results.items() if success
@@ -1726,8 +1871,8 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        # bluesky_password = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -1746,8 +1891,8 @@ def main():
     # Authenticate with Mastodon
     try:
 
-        # mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
-        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
+        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -1763,12 +1908,12 @@ def main():
     # Authenticate with Threads
     try:
 
-        # threads_app_id = os.environ.get("BLUESKY_USERNAME")
-        # threads_app_secret = os.environ.get("BLUESKY_USERNAME")
-        # threads_access_token = os.environ.get("BLUESKY_USERNAME")
-        threads_app_id = os.environ.get("THREADS_APP_ID")
-        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
-        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+        threads_app_id = os.environ.get("BLUESKY_USERNAME")
+        threads_app_secret = os.environ.get("BLUESKY_USERNAME")
+        threads_access_token = os.environ.get("BLUESKY_USERNAME")
+        # threads_app_id = os.environ.get("THREADS_APP_ID")
+        # threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        # threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
 
         if threads_app_id and threads_app_secret and threads_access_token:
             auth_results["threads"] = handler.authenticate_threads(
@@ -1783,12 +1928,12 @@ def main():
 
     # Authenticate with Instagram
     try:
-        # instagram_app_id = os.environ.get("BLUESKY_USERNAME")
-        # instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
-        # instagram_access_token = os.environ.get("BLUESKY_USERNAME")
-        instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
-        instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
-        instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        instagram_app_id = os.environ.get("BLUESKY_USERNAME")
+        instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
+        instagram_access_token = os.environ.get("BLUESKY_USERNAME")
+        # instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
+        # instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+        # instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if instagram_app_id and instagram_app_secret and instagram_access_token:
             auth_results["instagram"] = handler.authenticate_instagram(
@@ -1806,8 +1951,8 @@ def main():
 
     try:
         facebook_page_id = os.environ.get("FACEBOOK_PAGE_ID")
-        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
-        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
+        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if facebook_page_id and facebook_page_access_token:
             auth_results["facebook"] = handler.authenticate_facebook(
@@ -1819,6 +1964,20 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error during Facebook authentication: {str(e)}")
         auth_results["facebook"] = False
+
+    try:
+        pixelfed_access_token = os.environ.get("PIXELFED_ACCESS_TOKEN")
+
+        if pixelfed_access_token:
+            auth_results["pixelfed"] = handler.authenticate_pixelfed(
+                pixelfed_access_token, max_retries=3
+            )
+        else:
+            logging.warning("Pixelfed access token not found in environment variables")
+            auth_results["pixelfed"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Pixelfed authentication: {str(e)}")
+        auth_results["pixelfed"] = False
 
     # Check if at least one platform is authenticated
     if not any(auth_results.values()):
