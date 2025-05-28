@@ -328,29 +328,163 @@ class FIADocumentHandler:
                 time.sleep(2**attempt)
         return False
 
+    def _validate_facebook_token(self, access_token):
+        """
+        Validate and get information about the Facebook access token
+        """
+        try:
+            # Get token info
+            debug_url = f"https://graph.facebook.com/v22.0/debug_token"
+            debug_params = {"input_token": access_token, "access_token": access_token}
+
+            debug_response = requests.get(debug_url, params=debug_params)
+            if debug_response.status_code == 200:
+                debug_data = debug_response.json()
+                token_data = debug_data.get("data", {})
+
+                token_type = token_data.get("type", "unknown")
+                app_id = token_data.get("app_id", "unknown")
+                is_valid = token_data.get("is_valid", False)
+                scopes = token_data.get("scopes", [])
+
+                logging.info(
+                    f"Token type: {token_type}, App ID: {app_id}, Valid: {is_valid}"
+                )
+                logging.info(f"Token scopes: {', '.join(scopes) if scopes else 'None'}")
+
+                if not is_valid:
+                    logging.error("Token is not valid")
+                    return False
+
+                # Check for required permissions
+                required_permissions = ["pages_manage_posts", "pages_read_engagement"]
+                missing_permissions = [
+                    perm for perm in required_permissions if perm not in scopes
+                ]
+
+                if missing_permissions:
+                    logging.warning(
+                        f"Missing recommended permissions: {', '.join(missing_permissions)}"
+                    )
+
+                return True
+            else:
+                logging.warning(
+                    f"Could not validate token: {debug_response.status_code}"
+                )
+                return True  # Continue anyway
+
+        except Exception as e:
+            logging.warning(f"Token validation failed: {str(e)}")
+            return True  # Continue anyway
+
     def authenticate_facebook(self, page_id, page_access_token, max_retries=3):
         """
         Authenticate with Facebook Page API
-
-        Args:
-            page_id: Facebook Page ID
-            page_access_token: Page access token with pages_manage_posts permission
         """
+        # First validate the token
+        logging.info("Validating Facebook access token...")
+        if not self._validate_facebook_token(page_access_token):
+            logging.error("Token validation failed")
+            return False
+
         for attempt in range(max_retries):
             try:
                 self.facebook_page_id = page_id
                 self.facebook_page_access_token = page_access_token
 
-                # Test authentication by getting page info
-                url = f"https://graph.facebook.com/v22.0/{page_id}?fields=id,name&access_token={page_access_token}"
-                response = requests.get(url)
-                response.raise_for_status()
+                # Try different API approaches
+                test_endpoints = [
+                    # Method 1: Direct page access
+                    {
+                        "url": f"https://graph.facebook.com/v22.0/{page_id}",
+                        "params": {
+                            "fields": "id,name",
+                            "access_token": page_access_token,
+                        },
+                    },
+                    # Method 2: Through me/accounts if it's a user token
+                    {
+                        "url": f"https://graph.facebook.com/v22.0/me/accounts",
+                        "params": {"access_token": page_access_token},
+                    },
+                ]
 
-                page_data = response.json()
+                page_data = None
+                successful_method = None
+
+                for i, endpoint in enumerate(test_endpoints, 1):
+                    try:
+                        response = requests.get(
+                            endpoint["url"], params=endpoint["params"]
+                        )
+
+                        if response.status_code == 200:
+                            data = response.json()
+
+                            if i == 1:  # Direct page access
+                                if "id" in data and data["id"] == page_id:
+                                    page_data = data
+                                    successful_method = f"Direct page access"
+                                    break
+                            else:  # Through me/accounts
+                                pages = data.get("data", [])
+                                for page in pages:
+                                    if page["id"] == page_id:
+                                        page_data = page
+                                        # Update token to use page-specific token
+                                        self.facebook_page_access_token = page.get(
+                                            "access_token", page_access_token
+                                        )
+                                        successful_method = f"Via me/accounts"
+                                        break
+                                if page_data:
+                                    break
+                        else:
+                            logging.debug(
+                                f"Method {i} failed: {response.status_code} - {response.text[:200]}"
+                            )
+
+                    except Exception as e:
+                        logging.debug(f"Method {i} error: {str(e)}")
+                        continue
+
+                if not page_data:
+                    # Get detailed error from the first method
+                    response = requests.get(
+                        test_endpoints[0]["url"], params=test_endpoints[0]["params"]
+                    )
+                    if response.status_code != 200:
+                        try:
+                            error_data = response.json()
+                            error_msg = error_data.get("error", {})
+                            error_message = error_msg.get("message", "Unknown error")
+                            error_code = error_msg.get("code", "Unknown code")
+
+                            if error_code == 190:
+                                raise Exception(
+                                    f"Invalid access token (Code: {error_code}). Please regenerate your Facebook Page access token."
+                                )
+                            elif error_code == 100:
+                                raise Exception(
+                                    f"Invalid page ID (Code: {error_code}). Please check your Facebook Page ID: {page_id}"
+                                )
+                            else:
+                                raise Exception(
+                                    f"Facebook API Error - Code: {error_code}, Message: {error_message}"
+                                )
+                        except ValueError:
+                            raise Exception(
+                                f"HTTP {response.status_code}: {response.text}"
+                            )
+                    else:
+                        raise Exception(
+                            "Could not find or access the specified Facebook page"
+                        )
+
                 page_name = page_data.get("name", "Unknown")
-
                 logging.info(
-                    f"Successfully authenticated with Facebook Page: {page_name} (ID: {page_id})"
+                    f"Successfully authenticated with Facebook Page: {page_name} (ID: {page_id}) using {successful_method}"
                 )
                 self.facebook_authenticated = True
                 return True
