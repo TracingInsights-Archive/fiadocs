@@ -1871,8 +1871,8 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_USERNAME")
-        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        # bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -1891,8 +1891,8 @@ def main():
     # Authenticate with Mastodon
     try:
 
-        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
-        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+        # mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
+        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -1908,12 +1908,12 @@ def main():
     # Authenticate with Threads
     try:
 
-        threads_app_id = os.environ.get("BLUESKY_USERNAME")
-        threads_app_secret = os.environ.get("BLUESKY_USERNAME")
-        threads_access_token = os.environ.get("BLUESKY_USERNAME")
-        # threads_app_id = os.environ.get("THREADS_APP_ID")
-        # threads_app_secret = os.environ.get("THREADS_APP_SECRET")
-        # threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+        # threads_app_id = os.environ.get("BLUESKY_USERNAME")
+        # threads_app_secret = os.environ.get("BLUESKY_USERNAME")
+        # threads_access_token = os.environ.get("BLUESKY_USERNAME")
+        threads_app_id = os.environ.get("THREADS_APP_ID")
+        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
 
         if threads_app_id and threads_app_secret and threads_access_token:
             auth_results["threads"] = handler.authenticate_threads(
@@ -1928,12 +1928,12 @@ def main():
 
     # Authenticate with Instagram
     try:
-        instagram_app_id = os.environ.get("BLUESKY_USERNAME")
-        instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
-        instagram_access_token = os.environ.get("BLUESKY_USERNAME")
-        # instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
-        # instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
-        # instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        # instagram_app_id = os.environ.get("BLUESKY_USERNAME")
+        # instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
+        # instagram_access_token = os.environ.get("BLUESKY_USERNAME")
+        instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
+        instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+        instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if instagram_app_id and instagram_app_secret and instagram_access_token:
             auth_results["instagram"] = handler.authenticate_instagram(
@@ -1951,8 +1951,8 @@ def main():
 
     try:
         facebook_page_id = os.environ.get("FACEBOOK_PAGE_ID")
-        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
-        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
+        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if facebook_page_id and facebook_page_access_token:
             auth_results["facebook"] = handler.authenticate_facebook(
