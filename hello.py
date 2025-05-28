@@ -37,6 +37,9 @@ class FIADocumentHandler:
         self.facebook_page_id = None
         self.facebook_page_access_token = None
         self.pixelfed_client = None
+        self.telegram_bot_token = None
+        self.telegram_channel_id = None
+        self.telegram_authenticated = False
         self.pixelfed_authenticated = False
         self.bluesky_authenticated = False
         self.mastodon_authenticated = False
@@ -67,6 +70,224 @@ class FIADocumentHandler:
     def _save_processed_docs(self):
         with open("processed_docs.json", "w") as f:
             json.dump(self.processed_docs["urls"], f)
+
+    def post_to_telegram(self, image_paths, doc_url, doc_info=None):
+        """
+        Post to Telegram channel
+        """
+        if not self.telegram_authenticated:
+            logging.warning("Skipping Telegram post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+
+            max_title_length = 3000  # Telegram has 4096 character limit
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
+
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+
+            # Create message with proper Telegram formatting for channels
+            message = (
+                f"🏎️ <b>{doc_title}</b>\n\n📅 Published: {pub_date}\n\n{all_hashtags}"
+            )
+
+            # Add URL if it fits
+            if len(message) + len(doc_url) + 30 <= 4000:  # Leave buffer for formatting
+                message += f'\n\n📄 <a href="{doc_url}">View Document</a>'
+
+            # Process images in chunks (Telegram allows up to 10 images per media group)
+            for i in range(0, len(image_paths), 10):
+                chunk = image_paths[i : i + 10]
+
+                try:
+                    # Add delay between posts to respect rate limits
+                    if i > 0:
+                        time.sleep(3)  # Longer delay for channels
+
+                    # Determine message for this chunk
+                    if i == 0:
+                        chunk_message = message
+                    else:
+                        chunk_message = (
+                            f"🏎️ <b>{doc_title}</b> (Part {i//10 + 1})\n\n{all_hashtags}"
+                        )
+
+                    if len(chunk) == 1:
+                        # Single image post
+                        success = self._send_telegram_photo(chunk[0], chunk_message)
+                    else:
+                        # Media group post
+                        success = self._send_telegram_media_group(chunk, chunk_message)
+
+                    if success:
+                        logging.info(
+                            f"Successfully posted Telegram channel chunk {i//10 + 1}"
+                        )
+                    else:
+                        logging.error(
+                            f"Failed to post Telegram channel chunk {i//10 + 1}"
+                        )
+                        return False
+
+                except Exception as e:
+                    logging.error(
+                        f"Failed to process Telegram channel chunk {i//10 + 1}: {str(e)}"
+                    )
+                    return False
+
+            logging.info("Successfully posted to Telegram channel")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Telegram channel: {str(e)}")
+            return False
+
+    def authenticate_telegram(self, bot_token, channel_id, max_retries=3):
+        """
+        Authenticate with Telegram Bot API for channel posting
+        """
+        for attempt in range(max_retries):
+            try:
+                self.telegram_bot_token = bot_token
+                self.telegram_channel_id = channel_id
+
+                # Test authentication by getting bot info
+                url = f"https://api.telegram.org/bot{bot_token}/getMe"
+                response = requests.get(url)
+                response.raise_for_status()
+
+                result = response.json()
+                if result.get("ok"):
+                    bot_info = result.get("result", {})
+                    bot_username = bot_info.get("username", "Unknown")
+
+                    # Test channel access by getting chat info
+                    chat_url = f"https://api.telegram.org/bot{bot_token}/getChat"
+                    chat_response = requests.get(
+                        chat_url, params={"chat_id": channel_id}
+                    )
+
+                    if chat_response.status_code == 200:
+                        chat_result = chat_response.json()
+                        if chat_result.get("ok"):
+                            chat_info = chat_result.get("result", {})
+                            channel_title = chat_info.get("title", "Unknown Channel")
+                            logging.info(
+                                f"Successfully authenticated Telegram bot @{bot_username} for channel: {channel_title}"
+                            )
+                            self.telegram_authenticated = True
+                            return True
+                        else:
+                            raise Exception(f"Cannot access channel: {chat_result}")
+                    else:
+                        logging.warning(
+                            f"Cannot verify channel access, but bot authentication successful for @{bot_username}"
+                        )
+                        self.telegram_authenticated = True
+                        return True
+                else:
+                    raise Exception(f"Telegram API error: {result}")
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Telegram after {max_retries} attempts: {str(e)}"
+                    )
+                    self.telegram_authenticated = False
+                    return False
+                logging.warning(
+                    f"Telegram authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
+
+    def _send_telegram_photo(self, image_path, caption):
+        """Send a single photo to Telegram channel"""
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendPhoto"
+
+            with open(image_path, "rb") as photo:
+                files = {"photo": photo}
+                data = {
+                    "chat_id": self.telegram_channel_id,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                    "disable_notification": False,  # Enable notifications for important updates
+                }
+
+                response = requests.post(url, files=files, data=data)
+                response.raise_for_status()
+
+                result = response.json()
+                if result.get("ok"):
+                    message_id = result["result"]["message_id"]
+                    logging.info(
+                        f"Sent photo to Telegram channel: message {message_id}"
+                    )
+                    return True
+                else:
+                    logging.error(f"Telegram channel photo send failed: {result}")
+                    return False
+
+        except Exception as e:
+            logging.error(f"Failed to send photo to Telegram channel: {str(e)}")
+            return False
+
+    def _send_telegram_media_group(self, image_paths, caption):
+        """Send multiple photos as media group to Telegram channel"""
+        try:
+            url = (
+                f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMediaGroup"
+            )
+
+            # Prepare media array
+            media = []
+            files = {}
+
+            for i, image_path in enumerate(image_paths):
+                file_key = f"photo{i}"
+                files[file_key] = open(image_path, "rb")
+
+                media_item = {"type": "photo", "media": f"attach://{file_key}"}
+
+                # Add caption to first image only
+                if i == 0:
+                    media_item["caption"] = caption
+                    media_item["parse_mode"] = "HTML"
+
+                media.append(media_item)
+
+            data = {
+                "chat_id": self.telegram_channel_id,
+                "media": json.dumps(media),
+                "disable_notification": False,  # Enable notifications for important updates
+            }
+
+            try:
+                response = requests.post(url, files=files, data=data)
+                response.raise_for_status()
+
+                result = response.json()
+                if result.get("ok"):
+                    message_count = len(result["result"])
+                    logging.info(
+                        f"Sent media group to Telegram channel with {len(image_paths)} images ({message_count} messages)"
+                    )
+                    return True
+                else:
+                    logging.error(f"Telegram channel media group send failed: {result}")
+                    return False
+
+            finally:
+                # Close all file handles
+                for file_handle in files.values():
+                    file_handle.close()
+
+        except Exception as e:
+            logging.error(f"Failed to send media group to Telegram channel: {str(e)}")
+            return False
 
     def authenticate_pixelfed(self, access_token, max_retries=3):
         """
@@ -1845,6 +2066,18 @@ class FIADocumentHandler:
         else:
             results["pixelfed"] = False
 
+        # Post to Telegram
+        if self.telegram_authenticated:
+            try:
+                results["telegram"] = self.post_to_telegram(
+                    image_paths, doc_url, doc_info
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Telegram: {str(e)}")
+                results["telegram"] = False
+        else:
+            results["telegram"] = False
+
         # Log results
         successful_platforms = [
             platform for platform, success in results.items() if success
@@ -1871,8 +2104,8 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        # bluesky_password = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -1891,8 +2124,8 @@ def main():
     # Authenticate with Mastodon
     try:
 
-        # mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
-        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
+        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -1908,12 +2141,12 @@ def main():
     # Authenticate with Threads
     try:
 
-        # threads_app_id = os.environ.get("BLUESKY_USERNAME")
-        # threads_app_secret = os.environ.get("BLUESKY_USERNAME")
-        # threads_access_token = os.environ.get("BLUESKY_USERNAME")
-        threads_app_id = os.environ.get("THREADS_APP_ID")
-        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
-        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+        threads_app_id = os.environ.get("BLUESKY_USERNAME")
+        threads_app_secret = os.environ.get("BLUESKY_USERNAME")
+        threads_access_token = os.environ.get("BLUESKY_USERNAME")
+        # threads_app_id = os.environ.get("THREADS_APP_ID")
+        # threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        # threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
 
         if threads_app_id and threads_app_secret and threads_access_token:
             auth_results["threads"] = handler.authenticate_threads(
@@ -1928,12 +2161,12 @@ def main():
 
     # Authenticate with Instagram
     try:
-        # instagram_app_id = os.environ.get("BLUESKY_USERNAME")
-        # instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
-        # instagram_access_token = os.environ.get("BLUESKY_USERNAME")
-        instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
-        instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
-        instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        instagram_app_id = os.environ.get("BLUESKY_USERNAME")
+        instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
+        instagram_access_token = os.environ.get("BLUESKY_USERNAME")
+        # instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
+        # instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+        # instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if instagram_app_id and instagram_app_secret and instagram_access_token:
             auth_results["instagram"] = handler.authenticate_instagram(
@@ -1951,8 +2184,8 @@ def main():
 
     try:
         facebook_page_id = os.environ.get("FACEBOOK_PAGE_ID")
-        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
-        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
+        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if facebook_page_id and facebook_page_access_token:
             auth_results["facebook"] = handler.authenticate_facebook(
@@ -1966,7 +2199,8 @@ def main():
         auth_results["facebook"] = False
 
     try:
-        pixelfed_access_token = os.environ.get("PIXELFED_ACCESS_TOKEN")
+        pixelfed_access_token = os.environ.get("FACEBOOK_PAGE_ID")
+        # pixelfed_access_token = os.environ.get("PIXELFED_ACCESS_TOKEN")
 
         if pixelfed_access_token:
             auth_results["pixelfed"] = handler.authenticate_pixelfed(
@@ -1978,6 +2212,24 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error during Pixelfed authentication: {str(e)}")
         auth_results["pixelfed"] = False
+
+    # Update main function authentication section:
+    try:
+        telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        telegram_channel_id = os.environ.get(
+            "TELEGRAM_CHANNEL_ID"
+        )  # Changed from TELEGRAM_CHAT_ID
+
+        if telegram_bot_token and telegram_channel_id:
+            auth_results["telegram"] = handler.authenticate_telegram(
+                telegram_bot_token, telegram_channel_id, max_retries=3
+            )
+        else:
+            logging.warning("Telegram credentials not found in environment variables")
+            auth_results["telegram"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Telegram authentication: {str(e)}")
+        auth_results["telegram"] = False
 
     # Check if at least one platform is authenticated
     if not any(auth_results.values()):
