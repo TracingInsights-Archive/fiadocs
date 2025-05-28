@@ -8,5 +8,8 @@ Follow the bot on threads: https://www.threads.com/@fia_docs
 
 Follow the bot on instagram: https://www.instagram.com/fia_docs/
 
-Follow the bot on Pixelfed: https://pixelfed.social/fia_docs
+Follow the bot on Pixelfed: https://pixelfed.social/fia_do
+
 Follow the bot on Telegram: https://t.me/fia_docs
+
+TODO: Tumblr,Linkedin, reddit, twitter

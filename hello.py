@@ -39,6 +39,9 @@ class FIADocumentHandler:
         self.pixelfed_client = None
         self.telegram_bot_token = None
         self.telegram_channel_id = None
+        self.linkedin_access_token = None
+        self.linkedin_organization_id = None
+        self.linkedin_authenticated = False
         self.telegram_authenticated = False
         self.pixelfed_authenticated = False
         self.bluesky_authenticated = False
@@ -70,6 +73,264 @@ class FIADocumentHandler:
     def _save_processed_docs(self):
         with open("processed_docs.json", "w") as f:
             json.dump(self.processed_docs["urls"], f)
+
+    def authenticate_linkedin(self, access_token, organization_id, max_retries=3):
+        """
+        Authenticate with LinkedIn Pages API
+        """
+        for attempt in range(max_retries):
+            try:
+                self.linkedin_access_token = access_token
+                self.linkedin_organization_id = organization_id
+
+                # Test authentication by getting organization info
+                url = f"https://api.linkedin.com/v2/organizations/{organization_id}"
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                }
+
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+
+                org_data = response.json()
+                org_name = org_data.get("localizedName", "Unknown")
+
+                logging.info(
+                    f"Successfully authenticated with LinkedIn organization: {org_name}"
+                )
+                self.linkedin_authenticated = True
+                return True
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with LinkedIn after {max_retries} attempts: {str(e)}"
+                    )
+                    self.linkedin_authenticated = False
+                    return False
+                logging.warning(
+                    f"LinkedIn authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
+
+    def post_to_linkedin(self, image_paths, doc_url, doc_info=None):
+        """
+        Post to LinkedIn Page
+        """
+        if not self.linkedin_authenticated:
+            logging.warning("Skipping LinkedIn post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+
+            max_title_length = 1000
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
+
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+
+            # LinkedIn post text
+            post_text = f"{doc_title}\n\nPublished: {pub_date}\n\n{all_hashtags}\n\nSource: {doc_url}"
+
+            # LinkedIn has a 3000 character limit
+            if len(post_text) > 3000:
+                post_text = post_text[:2997] + "..."
+
+            # Process images in chunks (LinkedIn allows up to 20 images per post)
+            for i in range(0, len(image_paths), 20):
+                chunk = image_paths[i : i + 20]
+
+                try:
+                    # Add delay between posts to respect rate limits
+                    if i > 0:
+                        time.sleep(5)
+
+                    # Determine message for this chunk
+                    chunk_text = (
+                        post_text
+                        if i == 0
+                        else f"{doc_title} (Part {i//20 + 1})\n\n{all_hashtags}"
+                    )
+
+                    if len(chunk) == 1:
+                        # Single image post
+                        success = self._create_linkedin_single_post(
+                            chunk[0], chunk_text
+                        )
+                    else:
+                        # Multiple images post
+                        success = self._create_linkedin_multi_post(chunk, chunk_text)
+
+                    if success:
+                        logging.info(f"Successfully posted LinkedIn chunk {i//20 + 1}")
+                    else:
+                        logging.error(f"Failed to post LinkedIn chunk {i//20 + 1}")
+                        return False
+
+                except Exception as e:
+                    logging.error(
+                        f"Failed to process LinkedIn chunk {i//20 + 1}: {str(e)}"
+                    )
+                    return False
+
+            logging.info("Successfully posted to LinkedIn")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to LinkedIn: {str(e)}")
+            return False
+
+    def _create_linkedin_single_post(self, image_path, text):
+        """Create a single image post on LinkedIn"""
+        try:
+            # Step 1: Register upload
+            upload_url = self._register_linkedin_upload(image_path)
+            if not upload_url:
+                return False
+
+            # Step 2: Upload image
+            image_urn = self._upload_to_linkedin(image_path, upload_url)
+            if not image_urn:
+                return False
+
+            # Step 3: Create post
+            return self._create_linkedin_post(text, [image_urn])
+
+        except Exception as e:
+            logging.error(f"Failed to create LinkedIn single post: {str(e)}")
+            return False
+
+    def _create_linkedin_multi_post(self, image_paths, text):
+        """Create a multi-image post on LinkedIn"""
+        try:
+            image_urns = []
+
+            # Upload all images
+            for image_path in image_paths:
+                upload_url = self._register_linkedin_upload(image_path)
+                if upload_url:
+                    image_urn = self._upload_to_linkedin(image_path, upload_url)
+                    if image_urn:
+                        image_urns.append(image_urn)
+
+            if not image_urns:
+                logging.error("No images were successfully uploaded to LinkedIn")
+                return False
+
+            # Create post with all images
+            return self._create_linkedin_post(text, image_urns)
+
+        except Exception as e:
+            logging.error(f"Failed to create LinkedIn multi-post: {str(e)}")
+            return False
+
+    def _register_linkedin_upload(self, image_path):
+        """Register upload with LinkedIn and get upload URL"""
+        try:
+            url = "https://api.linkedin.com/v2/assets?action=registerUpload"
+
+            headers = {
+                "Authorization": f"Bearer {self.linkedin_access_token}",
+                "Content-Type": "application/json",
+                "X-Restli-Protocol-Version": "2.0.0",
+            }
+
+            # Get file size
+            file_size = os.path.getsize(image_path)
+
+            data = {
+                "registerUploadRequest": {
+                    "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+                    "owner": f"urn:li:organization:{self.linkedin_organization_id}",
+                    "serviceRelationships": [
+                        {
+                            "relationshipType": "OWNER",
+                            "identifier": "urn:li:userGeneratedContent",
+                        }
+                    ],
+                    "supportedUploadMechanism": ["SYNCHRONOUS_UPLOAD"],
+                    "fileSize": file_size,
+                }
+            }
+
+            response = requests.post(url, headers=headers, json=data)
+            response.raise_for_status()
+
+            result = response.json()
+            upload_mechanism = result["value"]["uploadMechanism"][
+                "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"
+            ]
+            upload_url = upload_mechanism["uploadUrl"]
+            asset_urn = result["value"]["asset"]
+
+            return {"upload_url": upload_url, "asset_urn": asset_urn}
+
+        except Exception as e:
+            logging.error(f"Failed to register LinkedIn upload: {str(e)}")
+            return None
+
+    def _upload_to_linkedin(self, image_path, upload_info):
+        """Upload image to LinkedIn"""
+        try:
+            with open(image_path, "rb") as f:
+                response = requests.put(upload_info["upload_url"], data=f)
+                response.raise_for_status()
+
+            return upload_info["asset_urn"]
+
+        except Exception as e:
+            logging.error(f"Failed to upload to LinkedIn: {str(e)}")
+            return None
+
+    def _create_linkedin_post(self, text, image_urns):
+        """Create LinkedIn post with images"""
+        try:
+            url = "https://api.linkedin.com/v2/ugcPosts"
+
+            headers = {
+                "Authorization": f"Bearer {self.linkedin_access_token}",
+                "Content-Type": "application/json",
+                "X-Restli-Protocol-Version": "2.0.0",
+            }
+
+            # Prepare media
+            media = []
+            for image_urn in image_urns:
+                media.append(
+                    {
+                        "status": "READY",
+                        "description": {"text": "FIA Document"},
+                        "media": image_urn,
+                        "title": {"text": "FIA Document"},
+                    }
+                )
+
+            data = {
+                "author": f"urn:li:organization:{self.linkedin_organization_id}",
+                "lifecycleState": "PUBLISHED",
+                "specificContent": {
+                    "com.linkedin.ugc.ShareContent": {
+                        "shareCommentary": {"text": text},
+                        "shareMediaCategory": "IMAGE",
+                        "media": media,
+                    }
+                },
+                "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+            }
+
+            response = requests.post(url, headers=headers, json=data)
+            response.raise_for_status()
+
+            result = response.json()
+            logging.info(f"Created LinkedIn post: {result.get('id', 'Unknown ID')}")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to create LinkedIn post: {str(e)}")
+            return False
 
     def post_to_telegram(self, image_paths, doc_url, doc_info=None):
         """
@@ -2078,6 +2339,18 @@ class FIADocumentHandler:
         else:
             results["telegram"] = False
 
+        # Post to LinkedIn
+        if self.linkedin_authenticated:
+            try:
+                results["linkedin"] = self.post_to_linkedin(
+                    image_paths, doc_url, doc_info
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error posting to LinkedIn: {str(e)}")
+                results["linkedin"] = False
+        else:
+            results["linkedin"] = False
+
         # Log results
         successful_platforms = [
             platform for platform, success in results.items() if success
@@ -2104,8 +2377,8 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        # bluesky_password = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -2124,8 +2397,8 @@ def main():
     # Authenticate with Mastodon
     try:
 
-        # mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
-        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
+        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -2141,12 +2414,12 @@ def main():
     # Authenticate with Threads
     try:
 
-        # threads_app_id = os.environ.get("BLUESKY_USERNAME")
-        # threads_app_secret = os.environ.get("BLUESKY_USERNAME")
-        # threads_access_token = os.environ.get("BLUESKY_USERNAME")
-        threads_app_id = os.environ.get("THREADS_APP_ID")
-        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
-        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+        threads_app_id = os.environ.get("BLUESKY_USERNAME")
+        threads_app_secret = os.environ.get("BLUESKY_USERNAME")
+        threads_access_token = os.environ.get("BLUESKY_USERNAME")
+        # threads_app_id = os.environ.get("THREADS_APP_ID")
+        # threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        # threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
 
         if threads_app_id and threads_app_secret and threads_access_token:
             auth_results["threads"] = handler.authenticate_threads(
@@ -2161,12 +2434,12 @@ def main():
 
     # Authenticate with Instagram
     try:
-        # instagram_app_id = os.environ.get("BLUESKY_USERNAME")
-        # instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
-        # instagram_access_token = os.environ.get("BLUESKY_USERNAME")
-        instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
-        instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
-        instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        instagram_app_id = os.environ.get("BLUESKY_USERNAME")
+        instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
+        instagram_access_token = os.environ.get("BLUESKY_USERNAME")
+        # instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
+        # instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+        # instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if instagram_app_id and instagram_app_secret and instagram_access_token:
             auth_results["instagram"] = handler.authenticate_instagram(
@@ -2184,8 +2457,8 @@ def main():
 
     try:
         facebook_page_id = os.environ.get("FACEBOOK_PAGE_ID")
-        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
-        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
+        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if facebook_page_id and facebook_page_access_token:
             auth_results["facebook"] = handler.authenticate_facebook(
@@ -2199,8 +2472,8 @@ def main():
         auth_results["facebook"] = False
 
     try:
-        # pixelfed_access_token = os.environ.get("FACEBOOK_PAGE_ID")
-        pixelfed_access_token = os.environ.get("PIXELFED_ACCESS_TOKEN")
+        pixelfed_access_token = os.environ.get("FACEBOOK_PAGE_ID")
+        # pixelfed_access_token = os.environ.get("PIXELFED_ACCESS_TOKEN")
 
         if pixelfed_access_token:
             auth_results["pixelfed"] = handler.authenticate_pixelfed(
@@ -2213,12 +2486,13 @@ def main():
         logging.error(f"Unexpected error during Pixelfed authentication: {str(e)}")
         auth_results["pixelfed"] = False
 
-    # Update main function authentication section:
     try:
-        telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        telegram_channel_id = os.environ.get(
-            "TELEGRAM_CHANNEL_ID"
-        )  # Changed from TELEGRAM_CHAT_ID
+        telegram_bot_token = os.environ.get("FACEBOOK_PAGE_ID")
+        telegram_channel_id = os.environ.get("FACEBOOK_PAGE_ID")
+        # telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        # telegram_channel_id = os.environ.get(
+        #     "TELEGRAM_CHANNEL_ID"
+        # )
 
         if telegram_bot_token and telegram_channel_id:
             auth_results["telegram"] = handler.authenticate_telegram(
@@ -2230,6 +2504,21 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error during Telegram authentication: {str(e)}")
         auth_results["telegram"] = False
+
+    try:
+        linkedin_access_token = os.environ.get("LINKEDIN_ACCESS_TOKEN")
+        linkedin_organization_id = os.environ.get("LINKEDIN_ORGANIZATION_ID")
+
+        if linkedin_access_token and linkedin_organization_id:
+            auth_results["linkedin"] = handler.authenticate_linkedin(
+                linkedin_access_token, linkedin_organization_id, max_retries=3
+            )
+        else:
+            logging.warning("LinkedIn credentials not found in environment variables")
+            auth_results["linkedin"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during LinkedIn authentication: {str(e)}")
+        auth_results["linkedin"] = False
 
     # Check if at least one platform is authenticated
     if not any(auth_results.values()):
