@@ -1783,12 +1783,12 @@ def main():
 
     # Authenticate with Instagram
     try:
-        instagram_app_id = os.environ.get("BLUESKY_USERNAME")
-        instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
-        instagram_access_token = os.environ.get("BLUESKY_USERNAME")
-        # instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
-        # instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
-        # instagram_access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+        # instagram_app_id = os.environ.get("BLUESKY_USERNAME")
+        # instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
+        # instagram_access_token = os.environ.get("BLUESKY_USERNAME")
+        instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
+        instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+        instagram_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if instagram_app_id and instagram_app_secret and instagram_access_token:
             auth_results["instagram"] = handler.authenticate_instagram(
@@ -1806,7 +1806,8 @@ def main():
 
     try:
         facebook_page_id = os.environ.get("FACEBOOK_PAGE_ID")
-        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ID")
+        # facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
 
         if facebook_page_id and facebook_page_access_token:
             auth_results["facebook"] = handler.authenticate_facebook(
