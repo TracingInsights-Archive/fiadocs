@@ -34,10 +34,13 @@ class FIADocumentHandler:
         self.instagram_app_secret = None
         self.instagram_access_token = None
         self.instagram_business_account_id = None
+        self.facebook_page_id = None
+        self.facebook_page_access_token = None
         self.bluesky_authenticated = False
         self.mastodon_authenticated = False
         self.threads_authenticated = False
         self.instagram_authenticated = False
+        self.facebook_authenticated = False
 
     def _load_processed_docs(self):
         try:
@@ -324,6 +327,220 @@ class FIADocumentHandler:
                 )
                 time.sleep(2**attempt)
         return False
+
+    def authenticate_facebook(self, page_id, page_access_token, max_retries=3):
+        """
+        Authenticate with Facebook Page API
+
+        Args:
+            page_id: Facebook Page ID
+            page_access_token: Page access token with pages_manage_posts permission
+        """
+        for attempt in range(max_retries):
+            try:
+                self.facebook_page_id = page_id
+                self.facebook_page_access_token = page_access_token
+
+                # Test authentication by getting page info
+                url = f"https://graph.facebook.com/v22.0/{page_id}?fields=id,name&access_token={page_access_token}"
+                response = requests.get(url)
+                response.raise_for_status()
+
+                page_data = response.json()
+                page_name = page_data.get("name", "Unknown")
+
+                logging.info(
+                    f"Successfully authenticated with Facebook Page: {page_name} (ID: {page_id})"
+                )
+                self.facebook_authenticated = True
+                return True
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Facebook after {max_retries} attempts: {str(e)}"
+                    )
+                    self.facebook_authenticated = False
+                    return False
+                logging.warning(
+                    f"Facebook authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
+
+    def post_to_facebook(self, image_paths, doc_url, doc_info=None):
+        """
+        Post to Facebook Page
+        """
+        if not self.facebook_authenticated:
+            logging.warning("Skipping Facebook post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+
+            max_title_length = 1500
+            if len(doc_title) > max_title_length:
+                doc_title = doc_title[: max_title_length - 3] + "..."
+
+            all_hashtags = f"{GLOBAL_HASHTAGS}"
+
+            # Create message with proper Facebook formatting
+            message = f"{doc_title}\n\nPublished: {pub_date}\n\n{all_hashtags}"
+
+            # Facebook has a character limit, add URL if it fits
+            if (
+                len(message) + len(doc_url) + 10 <= 8000
+            ):  # Facebook has ~8000 char limit
+                message += f"\n\nSource: {doc_url}"
+
+            # Process images in chunks (Facebook allows up to 10 images per post)
+            for i in range(0, len(image_paths), 10):
+                chunk = image_paths[i : i + 10]
+
+                try:
+                    # Add delay between posts to respect rate limits
+                    if i > 0:
+                        time.sleep(3)
+
+                    # Determine message for this chunk
+                    chunk_message = (
+                        message
+                        if i == 0
+                        else f"{doc_title} (Part {i//10 + 1})\n\n{all_hashtags}"
+                    )
+
+                    if len(chunk) == 1:
+                        # Single image post
+                        success = self._create_facebook_single_post(
+                            chunk[0], chunk_message
+                        )
+                    else:
+                        # Multiple images post
+                        success = self._create_facebook_multi_post(chunk, chunk_message)
+
+                    if success:
+                        logging.info(f"Successfully posted Facebook chunk {i//10 + 1}")
+                    else:
+                        logging.error(f"Failed to post Facebook chunk {i//10 + 1}")
+                        return False
+
+                except Exception as e:
+                    logging.error(
+                        f"Failed to process Facebook chunk {i//10 + 1}: {str(e)}"
+                    )
+                    return False
+
+            logging.info("Successfully posted to Facebook")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Facebook: {str(e)}")
+            return False
+
+    def _create_facebook_single_post(self, image_path, message):
+        """Create a single image post on Facebook Page"""
+        try:
+            # Upload image to get public URL
+            image_url = self._upload_image_to_public_url(image_path)
+            if not image_url:
+                logging.error("Failed to upload image to public URL for Facebook")
+                return False
+
+            # Create Facebook post
+            url = f"https://graph.facebook.com/v22.0/{self.facebook_page_id}/photos"
+
+            data = {
+                "url": image_url,
+                "caption": message,
+                "access_token": self.facebook_page_access_token,
+            }
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+            if "id" in result:
+                logging.info(f"Created Facebook photo post: {result['id']}")
+                return True
+            else:
+                logging.error(f"Facebook post creation failed: {result}")
+                return False
+
+        except Exception as e:
+            logging.error(f"Failed to create Facebook single post: {str(e)}")
+            return False
+
+    def _create_facebook_multi_post(self, image_paths, message):
+        """Create a multi-image post on Facebook Page"""
+        try:
+            # Upload all images and collect their URLs
+            image_urls = []
+            for image_path in image_paths:
+                image_url = self._upload_image_to_public_url(image_path)
+                if image_url:
+                    image_urls.append(image_url)
+                else:
+                    logging.warning(f"Failed to upload {image_path}, skipping")
+
+            if not image_urls:
+                logging.error(
+                    "No images were successfully uploaded for Facebook multi-post"
+                )
+                return False
+
+            # Create album post with multiple photos
+            url = f"https://graph.facebook.com/v22.0/{self.facebook_page_id}/feed"
+
+            # For multiple images, we'll create a post with the first image and message
+            # Facebook's API doesn't easily support multi-image posts via URL
+            # So we'll post the first image with the message
+            data = {
+                "message": message,
+                "link": image_urls[0],  # Use first image as main image
+                "access_token": self.facebook_page_access_token,
+            }
+
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+
+            result = response.json()
+            if "id" in result:
+                logging.info(f"Created Facebook multi-image post: {result['id']}")
+
+                # Post remaining images as comments if there are more than 1
+                if len(image_urls) > 1:
+                    post_id = result["id"]
+                    for i, img_url in enumerate(image_urls[1:], 2):
+                        try:
+                            comment_url = (
+                                f"https://graph.facebook.com/v22.0/{post_id}/comments"
+                            )
+                            comment_data = {
+                                "message": f"Page {i}",
+                                "attachment_url": img_url,
+                                "access_token": self.facebook_page_access_token,
+                            }
+                            comment_response = requests.post(
+                                comment_url, data=comment_data
+                            )
+                            if comment_response.status_code == 200:
+                                logging.info(f"Added image {i} as comment")
+                            else:
+                                logging.warning(f"Failed to add image {i} as comment")
+                        except Exception as e:
+                            logging.warning(
+                                f"Failed to add comment with image {i}: {str(e)}"
+                            )
+
+                return True
+            else:
+                logging.error(f"Facebook multi-post creation failed: {result}")
+                return False
+
+        except Exception as e:
+            logging.error(f"Failed to create Facebook multi-post: {str(e)}")
+            return False
 
     def _make_filename_readable(self, filename):
         # Remove file extension
@@ -1345,6 +1562,17 @@ class FIADocumentHandler:
         else:
             results["instagram"] = False
 
+        if self.facebook_authenticated:
+            try:
+                results["facebook"] = self.post_to_facebook(
+                    image_paths, doc_url, doc_info
+                )
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Facebook: {str(e)}")
+                results["facebook"] = False
+        else:
+            results["facebook"] = False
+
         # Log results
         successful_platforms = [
             platform for platform, success in results.items() if success
@@ -1371,7 +1599,8 @@ def main():
     # Authenticate with Bluesky
     try:
         bluesky_username = os.environ.get("BLUESKY_USERNAME")
-        bluesky_password = os.environ.get("BLUESKY_PASSWORD")
+        bluesky_password = os.environ.get("BLUESKY_USERNAME")
+        # bluesky_password = os.environ.get("BLUESKY_PASSWORD")
 
         if bluesky_username and bluesky_password:
             auth_results["bluesky"] = handler.authenticate_bluesky(
@@ -1390,7 +1619,8 @@ def main():
     # Authenticate with Mastodon
     try:
 
-        mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
+        mastodon_access_token = os.environ.get("BLUESKY_USERNAME")
+        # mastodon_access_token = os.environ.get("MASTODON_ACCESS_TOKEN")
 
         if mastodon_access_token:
             auth_results["mastodon"] = handler.authenticate_mastodon(
@@ -1406,9 +1636,12 @@ def main():
     # Authenticate with Threads
     try:
 
-        threads_app_id = os.environ.get("THREADS_APP_ID")
-        threads_app_secret = os.environ.get("THREADS_APP_SECRET")
-        threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
+        threads_app_id = os.environ.get("BLUESKY_USERNAME")
+        threads_app_secret = os.environ.get("BLUESKY_USERNAME")
+        threads_access_token = os.environ.get("BLUESKY_USERNAME")
+        # threads_app_id = os.environ.get("THREADS_APP_ID")
+        # threads_app_secret = os.environ.get("THREADS_APP_SECRET")
+        # threads_access_token = os.environ.get("THREADS_ACCESS_TOKEN")
 
         if threads_app_id and threads_app_secret and threads_access_token:
             auth_results["threads"] = handler.authenticate_threads(
@@ -1423,9 +1656,12 @@ def main():
 
     # Authenticate with Instagram
     try:
-        instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
-        instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
-        instagram_access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+        instagram_app_id = os.environ.get("BLUESKY_USERNAME")
+        instagram_app_secret = os.environ.get("BLUESKY_USERNAME")
+        instagram_access_token = os.environ.get("BLUESKY_USERNAME")
+        # instagram_app_id = os.environ.get("INSTAGRAM_APP_ID")
+        # instagram_app_secret = os.environ.get("INSTAGRAM_APP_SECRET")
+        # instagram_access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
 
         if instagram_app_id and instagram_app_secret and instagram_access_token:
             auth_results["instagram"] = handler.authenticate_instagram(
@@ -1440,6 +1676,21 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error during Instagram authentication: {str(e)}")
         auth_results["instagram"] = False
+
+    try:
+        facebook_page_id = os.environ.get("FACEBOOK_PAGE_ID")
+        facebook_page_access_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+
+        if facebook_page_id and facebook_page_access_token:
+            auth_results["facebook"] = handler.authenticate_facebook(
+                facebook_page_id, facebook_page_access_token, max_retries=3
+            )
+        else:
+            logging.warning("Facebook credentials not found in environment variables")
+            auth_results["facebook"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Facebook authentication: {str(e)}")
+        auth_results["facebook"] = False
 
     # Check if at least one platform is authenticated
     if not any(auth_results.values()):
