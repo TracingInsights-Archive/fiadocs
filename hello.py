@@ -573,100 +573,93 @@ class FIADocumentHandler:
             return False
 
     def _create_facebook_single_post(self, image_path, message):
-        """Create a single image post on Facebook Page"""
+        """Create a single image post on Facebook Page by uploading image directly"""
         try:
-            # Upload image to get public URL
-            image_url = self._upload_image_to_public_url(image_path)
-            if not image_url:
-                logging.error("Failed to upload image to public URL for Facebook")
-                return False
-
-            # Create Facebook post
             url = f"https://graph.facebook.com/v22.0/{self.facebook_page_id}/photos"
 
-            data = {
-                "url": image_url,
-                "caption": message,
-                "access_token": self.facebook_page_access_token,
-            }
+            # Upload image directly to Facebook
+            with open(image_path, "rb") as image_file:
+                files = {"source": image_file}
+                data = {
+                    "message": message,
+                    "access_token": self.facebook_page_access_token,
+                }
 
-            response = requests.post(url, data=data)
-            response.raise_for_status()
+                response = requests.post(url, files=files, data=data)
+                response.raise_for_status()
 
-            result = response.json()
-            if "id" in result:
-                logging.info(f"Created Facebook photo post: {result['id']}")
-                return True
-            else:
-                logging.error(f"Facebook post creation failed: {result}")
-                return False
+                result = response.json()
+                if "id" in result:
+                    logging.info(f"Created Facebook photo post: {result['id']}")
+                    return True
+                else:
+                    logging.error(f"Facebook post creation failed: {result}")
+                    return False
 
         except Exception as e:
             logging.error(f"Failed to create Facebook single post: {str(e)}")
             return False
 
     def _create_facebook_multi_post(self, image_paths, message):
-        """Create a multi-image post on Facebook Page"""
+        """Create a multi-image post on Facebook Page by uploading all images directly"""
         try:
-            # Upload all images and collect their URLs
-            image_urls = []
-            for image_path in image_paths:
-                image_url = self._upload_image_to_public_url(image_path)
-                if image_url:
-                    image_urls.append(image_url)
-                else:
-                    logging.warning(f"Failed to upload {image_path}, skipping")
+            # First, upload all images and get their IDs
+            photo_ids = []
 
-            if not image_urls:
+            for i, image_path in enumerate(image_paths):
+                try:
+                    # Upload each image without publishing
+                    url = f"https://graph.facebook.com/v22.0/{self.facebook_page_id}/photos"
+
+                    with open(image_path, "rb") as image_file:
+                        files = {"source": image_file}
+                        data = {
+                            "published": "false",  # Don't publish yet
+                            "access_token": self.facebook_page_access_token,
+                        }
+
+                        response = requests.post(url, files=files, data=data)
+                        response.raise_for_status()
+
+                        result = response.json()
+                        if "id" in result:
+                            photo_ids.append(result["id"])
+                            logging.info(f"Uploaded image {i+1}: {result['id']}")
+                        else:
+                            logging.warning(f"Failed to upload image {i+1}: {result}")
+
+                except Exception as e:
+                    logging.warning(f"Failed to upload image {i+1}: {str(e)}")
+                    continue
+
+            if not photo_ids:
                 logging.error(
                     "No images were successfully uploaded for Facebook multi-post"
                 )
                 return False
 
-            # Create album post with multiple photos
+            # Create the multi-photo post
             url = f"https://graph.facebook.com/v22.0/{self.facebook_page_id}/feed"
 
-            # For multiple images, we'll create a post with the first image and message
-            # Facebook's API doesn't easily support multi-image posts via URL
-            # So we'll post the first image with the message
+            # Prepare attached_media for multi-photo post
+            attached_media = []
+            for photo_id in photo_ids:
+                attached_media.append({"media_fbid": photo_id})
+
             data = {
                 "message": message,
-                "link": image_urls[0],  # Use first image as main image
+                "attached_media": attached_media,
                 "access_token": self.facebook_page_access_token,
             }
 
-            response = requests.post(url, data=data)
+            response = requests.post(url, json=data)
             response.raise_for_status()
 
             result = response.json()
             if "id" in result:
-                logging.info(f"Created Facebook multi-image post: {result['id']}")
-
-                # Post remaining images as comments if there are more than 1
-                if len(image_urls) > 1:
-                    post_id = result["id"]
-                    for i, img_url in enumerate(image_urls[1:], 2):
-                        try:
-                            comment_url = (
-                                f"https://graph.facebook.com/v22.0/{post_id}/comments"
-                            )
-                            comment_data = {
-                                "message": f"Page {i}",
-                                "attachment_url": img_url,
-                                "access_token": self.facebook_page_access_token,
-                            }
-                            comment_response = requests.post(
-                                comment_url, data=comment_data
-                            )
-                            if comment_response.status_code == 200:
-                                logging.info(f"Added image {i} as comment")
-                            else:
-                                logging.warning(f"Failed to add image {i} as comment")
-                        except Exception as e:
-                            logging.warning(
-                                f"Failed to add comment with image {i}: {str(e)}"
-                            )
-
+                logging.info(
+                    f"Created Facebook multi-image post: {result['id']} with {len(photo_ids)} images"
+                )
                 return True
             else:
                 logging.error(f"Facebook multi-post creation failed: {result}")
