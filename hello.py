@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -6,10 +7,12 @@ from datetime import datetime
 
 import pdf2image
 import requests
+import requests_oauthlib
 from atproto import Client
 from bs4 import BeautifulSoup
 from mastodon import Mastodon
 from PIL import Image
+from requests_oauthlib import OAuth1Session
 
 # Global hashtags - Change in 2 places
 GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SpanishGP"
@@ -41,6 +44,13 @@ class FIADocumentHandler:
         self.telegram_channel_id = None
         self.linkedin_access_token = None
         self.linkedin_organization_id = None
+        self.tumblr_consumer_key = None
+        self.tumblr_consumer_secret = None
+        self.tumblr_access_token = None
+        self.tumblr_access_token_secret = None
+        self.tumblr_blog_name = None
+        self.tumblr_session = None
+        self.tumblr_authenticated = False
         self.linkedin_authenticated = False
         self.telegram_authenticated = False
         self.pixelfed_authenticated = False
@@ -73,6 +83,323 @@ class FIADocumentHandler:
     def _save_processed_docs(self):
         with open("processed_docs.json", "w") as f:
             json.dump(self.processed_docs["urls"], f)
+
+    def authenticate_tumblr(
+        self,
+        consumer_key,
+        consumer_secret,
+        access_token,
+        access_token_secret,
+        blog_name,
+        max_retries=3,
+    ):
+        """
+        Authenticate with Tumblr API using OAuth 1.0a
+        """
+        for attempt in range(max_retries):
+            try:
+                self.tumblr_consumer_key = consumer_key
+                self.tumblr_consumer_secret = consumer_secret
+                self.tumblr_access_token = access_token
+                self.tumblr_access_token_secret = access_token_secret
+                self.tumblr_blog_name = blog_name
+
+                # Create OAuth1 session
+                auth = OAuth1Session(
+                    consumer_key,
+                    client_secret=consumer_secret,
+                    resource_owner_key=access_token,
+                    resource_owner_secret=access_token_secret,
+                )
+
+                self.tumblr_session = auth
+
+                # Test authentication by getting blog info
+                response = self.tumblr_session.get(
+                    f"https://api.tumblr.com/v2/blog/{blog_name}/info"
+                )
+                response.raise_for_status()
+
+                blog_data = response.json()
+
+                if blog_data.get("meta", {}).get("status") == 200:
+                    blog_info = blog_data.get("response", {}).get("blog", {})
+                    blog_title = blog_info.get("title", "Unknown")
+                    logging.info(
+                        f"Successfully authenticated with Tumblr blog: {blog_title} ({blog_name})"
+                    )
+                    self.tumblr_authenticated = True
+                    return True
+                else:
+                    raise Exception(f"Failed to get blog info: {blog_data}")
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(
+                        f"Failed to authenticate with Tumblr after {max_retries} attempts: {str(e)}"
+                    )
+                    self.tumblr_authenticated = False
+                    return False
+                logging.warning(
+                    f"Tumblr authentication attempt {attempt + 1} failed, retrying... Error: {str(e)}"
+                )
+                time.sleep(2**attempt)
+        return False
+
+    def post_to_tumblr(self, image_paths, doc_url, doc_info=None):
+        """
+        Post to Tumblr using the Neue Post Format (NPF) API
+        Tumblr supports up to 10 images per post and rich content blocks
+        """
+        if not self.tumblr_authenticated:
+            logging.warning("Skipping Tumblr post - not authenticated")
+            return False
+
+        try:
+            doc_title, pub_date = self._parse_document_info(doc_url, doc_info)
+
+            # Process images in chunks of 10 (Tumblr's limit per post)
+            for i in range(0, len(image_paths), 10):
+                chunk = image_paths[i : i + 10]
+
+                try:
+                    # Add delay between posts to respect rate limits
+                    if i > 0:
+                        time.sleep(5)
+
+                    # Determine content for this chunk
+                    if i == 0:
+                        title = doc_title
+                        tags = ["f1", "formula1", "fia", "SpanishGP"]
+                    else:
+                        title = f"{doc_title} (Part {i//10 + 1})"
+                        tags = ["f1", "formula1", "fia"]
+
+                    # Create NPF post
+                    success = self._create_tumblr_npf_post(
+                        chunk, title, pub_date, doc_url, tags, i == 0
+                    )
+
+                    if success:
+                        logging.info(f"Successfully posted Tumblr chunk {i//10 + 1}")
+                    else:
+                        logging.error(f"Failed to post Tumblr chunk {i//10 + 1}")
+                        return False
+
+                except Exception as e:
+                    logging.error(
+                        f"Failed to process Tumblr chunk {i//10 + 1}: {str(e)}"
+                    )
+                    return False
+
+            logging.info("Successfully posted to Tumblr")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to post to Tumblr: {str(e)}")
+            return False
+
+    def _create_tumblr_npf_post(
+        self, image_paths, title, pub_date, doc_url, tags, include_url=True
+    ):
+        """Create a Tumblr post using the Neue Post Format (NPF) API"""
+        try:
+            # Create NPF content blocks
+            content_blocks = []
+
+            # Add title block with bold formatting
+            content_blocks.append(
+                {
+                    "type": "text",
+                    "text": title,
+                    "formatting": [{"start": 0, "end": len(title), "type": "bold"}],
+                }
+            )
+
+            # Add publication date block
+            pub_text = f"\nPublished: {pub_date}"
+            content_blocks.append({"type": "text", "text": pub_text})
+
+            # Upload images and create media blocks
+            uploaded_media = []
+            for i, img_path in enumerate(image_paths):
+                try:
+                    media_object = self._upload_tumblr_media(img_path)
+                    if media_object:
+                        uploaded_media.append(media_object)
+
+                        # Add image block to content
+                        content_blocks.append(
+                            {
+                                "type": "image",
+                                "media": [media_object],
+                                "alt_text": f"FIA Document - {title} (Page {i+1})",
+                            }
+                        )
+                    else:
+                        logging.warning(f"Failed to upload image {img_path} to Tumblr")
+
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to process image {img_path} for Tumblr: {str(e)}"
+                    )
+                    continue
+
+            # Add source link block (only for first chunk)
+            if include_url:
+                link_text = f"\nSource: {doc_url}"
+                content_blocks.append(
+                    {
+                        "type": "text",
+                        "text": link_text,
+                        "formatting": [
+                            {
+                                "start": 9,  # After "Source: "
+                                "end": len(link_text),
+                                "type": "link",
+                                "url": doc_url,
+                            }
+                        ],
+                    }
+                )
+
+            # Add hashtags block
+            hashtag_text = f"\n\n{GLOBAL_HASHTAGS}"
+            content_blocks.append({"type": "text", "text": hashtag_text})
+
+            # Create the NPF post
+            post_data = {"content": content_blocks, "tags": tags, "state": "published"}
+
+            # Post to Tumblr using NPF API
+            response = self.tumblr_session.post(
+                f"https://api.tumblr.com/v2/blog/{self.tumblr_blog_name}/posts",
+                json=post_data,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "FIADocsBot/1.0",
+                },
+            )
+            response.raise_for_status()
+
+            result = response.json()
+
+            if result.get("meta", {}).get("status") == 201:
+                post_id = result.get("response", {}).get("id")
+                logging.info(f"Created Tumblr NPF post: {post_id}")
+                return True
+            else:
+                logging.error(f"Tumblr NPF post creation failed: {result}")
+                return False
+
+        except Exception as e:
+            logging.error(f"Failed to create Tumblr NPF post: {str(e)}")
+            # Fallback to legacy photo post
+            return self._create_tumblr_legacy_post(
+                image_paths, title, pub_date, doc_url, tags, include_url
+            )
+
+    def _upload_tumblr_media(self, image_path):
+        """Upload media to Tumblr and return media object"""
+        try:
+            # Read and encode image
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+
+            # Encode image as base64
+            image_b64 = base64.b64encode(image_data).decode("utf-8")
+
+            # Determine MIME type
+            if image_path.lower().endswith(".png"):
+                mime_type = "image/png"
+            elif image_path.lower().endswith(".gif"):
+                mime_type = "image/gif"
+            else:
+                mime_type = "image/jpeg"
+
+            # Create media object for NPF
+            media_object = {
+                "type": mime_type,
+                "identifier": f"media_{int(time.time())}_{os.path.basename(image_path)}",
+                "data": image_b64,
+            }
+
+            return media_object
+
+        except Exception as e:
+            logging.error(f"Failed to upload media to Tumblr: {str(e)}")
+            return None
+
+    def _create_tumblr_legacy_post(
+        self, image_paths, title, pub_date, doc_url, tags, include_url=True
+    ):
+        """Fallback to legacy photo post format"""
+        try:
+            logging.info("Using Tumblr legacy photo post format")
+
+            # Create caption
+            caption_parts = [f"<strong>{title}</strong>"]
+            caption_parts.append(f"Published: {pub_date}")
+
+            if include_url:
+                caption_parts.append(f'<a href="{doc_url}">Source</a>')
+
+            caption_parts.append(GLOBAL_HASHTAGS)
+            caption = "<br><br>".join(caption_parts)
+
+            # Prepare form data for multipart upload
+            files = {}
+            data = {
+                "type": "photo",
+                "state": "published",
+                "tags": ",".join(tags),
+                "caption": caption,
+            }
+
+            # Add images as form data
+            for i, img_path in enumerate(image_paths):
+                try:
+                    files[f"data[{i}]"] = (
+                        os.path.basename(img_path),
+                        open(img_path, "rb"),
+                        "image/jpeg",
+                    )
+                except Exception as e:
+                    logging.warning(f"Failed to prepare image {img_path}: {str(e)}")
+                    continue
+
+            if not files:
+                logging.error("No images to upload for Tumblr legacy post")
+                return False
+
+            try:
+                # Post using legacy API
+                response = self.tumblr_session.post(
+                    f"https://api.tumblr.com/v2/blog/{self.tumblr_blog_name}/post",
+                    data=data,
+                    files=files,
+                    headers={"User-Agent": "FIADocsBot/1.0"},
+                )
+                response.raise_for_status()
+
+                result = response.json()
+
+                if result.get("meta", {}).get("status") == 201:
+                    post_id = result.get("response", {}).get("id")
+                    logging.info(f"Created Tumblr legacy post: {post_id}")
+                    return True
+                else:
+                    logging.error(f"Tumblr legacy post creation failed: {result}")
+                    return False
+
+            finally:
+                # Close all file handles
+                for file_handle in files.values():
+                    if hasattr(file_handle, "close"):
+                        file_handle[1].close()
+
+        except Exception as e:
+            logging.error(f"Failed to create Tumblr legacy post: {str(e)}")
+            return False
 
     def authenticate_linkedin(self, access_token, organization_id, max_retries=3):
         """
@@ -2351,6 +2678,16 @@ class FIADocumentHandler:
         else:
             results["linkedin"] = False
 
+        # Post to Tumblr
+        if self.tumblr_authenticated:
+            try:
+                results["tumblr"] = self.post_to_tumblr(image_paths, doc_url, doc_info)
+            except Exception as e:
+                logging.error(f"Unexpected error posting to Tumblr: {str(e)}")
+                results["tumblr"] = False
+        else:
+            results["tumblr"] = False
+
         # Log results
         successful_platforms = [
             platform for platform, success in results.items() if success
@@ -2518,7 +2855,39 @@ def main():
         logging.error(f"Unexpected error during LinkedIn authentication: {str(e)}")
         auth_results["linkedin"] = False
 
-    # Check if at least one platform is authenticated
+    # Authenticate with Tumblr
+    try:
+        tumblr_consumer_key = os.environ.get("TUMBLR_CONSUMER_KEY")
+        tumblr_consumer_secret = os.environ.get("TUMBLR_CONSUMER_SECRET")
+        tumblr_access_token = os.environ.get("TUMBLR_ACCESS_TOKEN")
+        tumblr_access_token_secret = os.environ.get("TUMBLR_ACCESS_TOKEN_SECRET")
+        tumblr_blog_name = os.environ.get("TUMBLR_BLOG_NAME")
+
+        if all(
+            [
+                tumblr_consumer_key,
+                tumblr_consumer_secret,
+                tumblr_access_token,
+                tumblr_access_token_secret,
+                tumblr_blog_name,
+            ]
+        ):
+            auth_results["tumblr"] = handler.authenticate_tumblr(
+                tumblr_consumer_key,
+                tumblr_consumer_secret,
+                tumblr_access_token,
+                tumblr_access_token_secret,
+                tumblr_blog_name,
+                max_retries=3,
+            )
+        else:
+            logging.warning("Tumblr credentials not found in environment variables")
+            auth_results["tumblr"] = False
+    except Exception as e:
+        logging.error(f"Unexpected error during Tumblr authentication: {str(e)}")
+        auth_results["tumblr"] = False
+
+        # Check if at least one platform is authenticated
     if not any(auth_results.values()):
         logging.error("Failed to authenticate with any social media platform. Exiting.")
         return
