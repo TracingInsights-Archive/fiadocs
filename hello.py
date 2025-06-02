@@ -15,7 +15,7 @@ from PIL import Image
 from requests_oauthlib import OAuth1Session
 
 # Global hashtags - Change in 2 places
-GLOBAL_HASHTAGS = "#f1 #formula1 #fia #SpanishGP"
+GLOBAL_HASHTAGS = "#f1 #formula1 #fia #CanadianGP"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -170,7 +170,7 @@ class FIADocumentHandler:
                     # Determine content for this chunk
                     if i == 0:
                         title = doc_title
-                        tags = ["f1", "formula1", "fia", "SpanishGP"]
+                        tags = ["f1", "formula1", "fia", "CanadianGP"]
                     else:
                         title = f"{doc_title} (Part {i//10 + 1})"
                         tags = ["f1", "formula1", "fia"]
@@ -1671,15 +1671,15 @@ class FIADocumentHandler:
     def _get_current_gp_hashtag(self):
         f1_calendar = {
             "2024-02-29": "#BahrainGP",
-            "2024-03-07": "#SpanishGP",
+            "2024-03-07": "#CanadianGP",
             "2024-03-21": "#AustralianGP",
             "2024-04-04": "#JapaneseGP",
             "2024-04-18": "#ChineseGP",
-            "2024-05-02": "#SpanishGP",
+            "2024-05-02": "#CanadianGP",
             "2024-05-16": "#EmiliaRomagnaGP",
-            "2024-05-23": "#SpanishGP",
+            "2024-05-23": "#CanadianGP",
             "2024-06-06": "#CanadianGP",
-            "2024-06-20": "#SpanishGP",
+            "2024-06-20": "#CanadianGP",
             "2024-07-04": "#AustrianGP",
             "2024-07-18": "#BritishGP",
             "2024-08-01": "#HungarianGP",
@@ -1746,7 +1746,7 @@ class FIADocumentHandler:
                 )
 
             # Make all hashtags clickable
-            all_tags = ["f1", "formula1", "fia", "SpanishGP"]
+            all_tags = ["f1", "formula1", "fia", "CanadianGP"]
             for tag in all_tags:
                 tag_with_hash = f"#{tag}"
                 tag_pos = formatted_text.find(tag_with_hash)
